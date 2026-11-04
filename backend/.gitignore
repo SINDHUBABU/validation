@@ -1,0 +1,6 @@
+.env
+*.db
+datasphere_chat_sessions.db
+rag_knowledge.db
+__pycache__/
+*.pyc

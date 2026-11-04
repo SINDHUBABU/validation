@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172b4d;
+  background: #f4f7fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: #f4f7fb; }
+button, input, textarea, select { font: inherit; }
+code, pre, .font-mono { font-family: "JetBrains Mono", "Fira Code", "Roboto Mono", Menlo, monospace; }
+
+/* The dashboard uses dark utility classes in older views. Keep them legible
+   while presenting a consistent, quiet light workspace. */
+#root, #root > div { background-color: #f4f7fb !important; color: #172b4d !important; }
+#root main, #root aside { color: #172b4d !important; }
+.brand-logo { width: 68px !important; height: 40px !important; max-width: 100%; object-fit: contain; object-position: left center; }
+.brand-logo-collapsed { width: 48px !important; height: 28px !important; }
+#root .section-count { color: #1e40af !important; }
+#root button.bg-blue-600 .section-count { color: #1e40af !important; background-color: #eff6ff !important; }
+#root pre.sql-code-block { color: #e2e8f0 !important; background-color: #0f172a !important; border: 1px solid #1e293b !important; }
+#root [class*="bg-[#"] { background-color: #fff !important; }
+#root [class*="bg-black/"], #root [class*="bg-slate-950"] { background-color: #f8fafc !important; }
+#root [class*="bg-slate-900"] { background-color: #f1f5f9 !important; }
+#root [class*="bg-slate-800"] { background-color: #e8eef5 !important; }
+#root [class*="bg-blue-950"] { background-color: #eff6ff !important; }
+#root [class*="bg-purple-950"] { background-color: #f5f3ff !important; }
+#root [class*="bg-emerald-950"] { background-color: #ecfdf5 !important; }
+#root [class*="bg-teal-950"] { background-color: #f0fdfa !important; }
+#root [class*="bg-amber-950"] { background-color: #fffbeb !important; }
+#root [class*="bg-rose-950"] { background-color: #fff1f2 !important; }
+#root [class*="border-slate-800"], #root [class*="border-slate-700"], #root [class*="border-slate-600"] { border-color: #d7e0ea !important; }
+#root [class*="text-white"], #root [class*="text-slate-100"], #root [class*="text-slate-200"], #root [class*="text-slate-300"] { color: #172b4d !important; }
+#root [class*="text-slate-400"] { color: #52647a !important; }
+#root [class*="text-slate-500"] { color: #64748b !important; }
+#root [class*="text-blue-300"] { color: #175cd3 !important; }
+#root [class*="text-emerald-300"], #root [class*="text-emerald-400"] { color: #087443 !important; }
+#root [class*="text-purple-300"] { color: #6941c6 !important; }
+#root [class*="text-amber-300"] { color: #a15c07 !important; }
+#root [class*="text-rose-200"] { color: #b42318 !important; }
+#root [class*="hover:bg-slate-800"]:hover, #root [class*="hover:bg-slate-700"]:hover { background-color: #e7eef6 !important; }
+#root button.bg-blue-600, #root button.bg-blue-700, #root button.bg-emerald-600, #root button.bg-emerald-700, #root button.bg-teal-700, #root button[class*="bg-gradient-to-r"] { color: #fff !important; }
+#root button.bg-blue-600 *, #root button.bg-blue-700 *, #root button.bg-emerald-600 *, #root button.bg-emerald-700 *, #root button.bg-teal-700 * { color: inherit !important; }
+#root input, #root textarea, #root select { background-color: #fff !important; color: #172b4d !important; border-color: #cbd5e1 !important; }
+#root pre { background-color: #f8fafc !important; border-color: #d7e0ea !important; }
+#root table thead { background-color: #eef3f8 !important; }
+#root table tbody tr { border-color: #e2e8f0 !important; }
+#root .shadow-xl, #root .shadow-2xl { box-shadow: 0 8px 28px rgb(15 23 42 / 7%) !important; }
+
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }

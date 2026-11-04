@@ -1,0 +1,37 @@
+# Environment variables & secrets
+.env
+backend/.env
+frontend/.env
+*.env.local
+
+# Databases & local state
+*.db
+*.sqlite
+*.sqlite3
+backend/datasphere_chat_sessions.db
+backend/rag_knowledge.db
+
+# Python
+__pycache__/
+backend/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.npm
+.eslintcache
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
