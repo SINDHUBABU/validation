@@ -295,7 +295,11 @@ class CdsStagingStore:
             db.close()
 
     @staticmethod
-    def _formula_sql(expression: str, columns: list[str]) -> str:
+    def _formula_sql(
+        expression: str,
+        columns: list[str],
+        numeric_columns: set[str] | None = None,
+    ) -> str:
         """Normalize Datasphere calculated-field expressions for SQLite."""
         if not isinstance(expression, str) or not expression.strip():
             raise ValueError("Calculated-field formulas must be non-empty strings.")
@@ -335,6 +339,47 @@ class CdsStagingStore:
                 normalized,
                 flags=re.IGNORECASE,
             )
+        # ADT rows are stored as TEXT in SQLite so identifiers retain their
+        # exact formatting. Cast typed numeric fields only when comparing them
+        # with numeric literals; otherwise values such as "100" compare
+        # lexicographically with 40 and disagree with CDS numeric semantics.
+        numeric_columns = {name.casefold() for name in (numeric_columns or set())}
+        for column in columns:
+            quoted_column = re.escape('"' + column.replace('"', '""') + '"')
+            comparison = re.compile(
+                rf"(?P<field>{quoted_column})\s*(?P<operator>>=|<=|<>|!=|=|>|<)\s*"
+                rf"(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\b",
+                re.IGNORECASE,
+            )
+            def normalize_comparison(match: re.Match[str]) -> str:
+                operator = match.group("operator")
+                if operator not in {">", ">=", "<", "<="} and column.casefold() not in numeric_columns:
+                    return match.group(0)
+                return (
+                    f"CAST({match.group('field')} AS REAL) "
+                    f"{operator} {match.group('number')}"
+                )
+            normalized = comparison.sub(
+                normalize_comparison,
+                normalized,
+            )
+            reverse_comparison = re.compile(
+                rf"(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*"
+                rf"(?P<operator>>=|<=|<>|!=|=|>|<)\s*(?P<field>{quoted_column})",
+                re.IGNORECASE,
+            )
+            def normalize_reverse_comparison(match: re.Match[str]) -> str:
+                operator = match.group("operator")
+                if operator not in {">", ">=", "<", "<="} and column.casefold() not in numeric_columns:
+                    return match.group(0)
+                return (
+                    f"{match.group('number')} {operator} "
+                    f"CAST({match.group('field')} AS REAL)"
+                )
+            normalized = reverse_comparison.sub(
+                normalize_reverse_comparison,
+                normalized,
+            )
         return normalized
 
     def write_source_csv(
@@ -355,6 +400,25 @@ class CdsStagingStore:
             if snapshot["expires_at"] and snapshot["expires_at"] <= time.time():
                 raise ValueError(f"The staged snapshot for {source_name} has expired. Fetch it again from ADT.")
             source_columns = json.loads(snapshot["fields_json"])
+            column_types = json.loads(snapshot["column_types_json"] or "{}")
+            type_lookup = {str(name).casefold(): str(value or "").casefold()
+                           for name, value in column_types.items()}
+            numeric_type_markers = (
+                "int", "decimal", "numeric", "float", "double", "real",
+                "number", "decfloat", "smalldecimal", "curr", "quan",
+            )
+            numeric_type_codes = {
+                "i", "p", "f", "int1", "int2", "int4", "int8",
+                "dec", "decfloat16", "decfloat34", "curr", "quan",
+            }
+            numeric_columns = {
+                name for name in source_columns
+                if (
+                    type_lookup.get(name.casefold(), "") in numeric_type_codes
+                    or any(marker in type_lookup.get(name.casefold(), "")
+                           for marker in numeric_type_markers)
+                )
+            }
             source_lookup = {name.casefold(): name for name in source_columns}
             formulas = calculated_fields or {}
             # Match the final Datasphere projection. Formula inputs can still
@@ -380,7 +444,9 @@ class CdsStagingStore:
                     expressions = [item for item in expressions if item.strip('"').casefold() != clean_name.casefold()]
                 if not clean_name:
                     raise ValueError("Calculated field names must not be empty.")
-                safe_expression = self._formula_sql(str(expression), source_columns)
+                safe_expression = self._formula_sql(
+                    str(expression), source_columns, numeric_columns
+                )
                 if clean_name.casefold() in requested_set:
                     expressions.append(f"({safe_expression}) AS {self._quote_identifier(clean_name)}")
                     result_columns.append(clean_name)
@@ -434,7 +500,9 @@ class CdsStagingStore:
             if where_clause and where_clause.strip():
                 if any(token in where_clause for token in (";", "--", "/*", "*/")):
                     raise ValueError("CDS metadata filter contains unsupported SQL statement syntax.")
-                translated_where = self._formula_sql(where_clause, source_columns)
+                translated_where = self._formula_sql(
+                    where_clause, source_columns, numeric_columns
+                )
                 query += f" WHERE ({translated_where})"
             cursor = db.execute(query)
             actual_columns = [item[0] for item in cursor.description or []]

@@ -1489,6 +1489,27 @@ async def query_final_cds_csv(request: StagedCsvPromptRequest):
                 return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
 
             connection.set_authorizer(read_only_authorizer)
+            # CSV columns are loaded as TEXT so SAP identifiers retain their
+            # leading zeroes (for example ACCOUNTINGDOCUMENTITEM='002'). The
+            # generated SQL may express the same identifier as numeric 2 or
+            # text '2'. Compare numeric predicates numerically in that case.
+            numeric_comparison = re.compile(
+                r"(?P<lhs>(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?(?:\"(?:[^\"]|\"\")+\"|[A-Za-z_][A-Za-z0-9_]*))"
+                r"\s*(?P<operator><=|>=|<>|!=|=|<|>)\s*"
+                r"(?P<rhs>'[+-]?\d+(?:\.\d+)?'|[+-]?\d+(?:\.\d+)?)"
+            )
+            known_columns = {column.casefold() for column in columns}
+
+            def normalize_numeric_comparison(match: re.Match[str]) -> str:
+                lhs = match.group("lhs")
+                identifier = lhs.rsplit(".", 1)[-1].strip().strip('"').replace('""', '"')
+                if identifier.casefold() not in known_columns:
+                    return match.group(0)
+                rhs = match.group("rhs")
+                numeric_rhs = rhs[1:-1] if rhs.startswith("'") else rhs
+                return f"CAST({lhs} AS NUMERIC) {match.group('operator')} {numeric_rhs}"
+
+            sql = numeric_comparison.sub(normalize_numeric_comparison, sql)
             cursor = connection.execute(sql)
             result_columns = [item[0] for item in (cursor.description or [])]
             result_rows = [dict(zip(result_columns, row)) for row in cursor.fetchall()]
