@@ -137,6 +137,53 @@ function getCalculatedFieldFormulas(details?: ViewDetails | null): Record<string
   const formulas: Record<string, string> = {};
   if (!details) return formulas;
 
+  // Datasphere metadata can place a calculation on the output field, its
+  // calculated-column record, a nested query definition, or a lineage node.
+  // Walk the complete response and associate expressions only with an
+  // explicitly named output field so unrelated SQL expressions are not used.
+  const formulaKeys = new Set(['expression', 'formula', 'calculation', 'calculatedexpression', 'calculated_expression', 'calculation_expression', 'calc_expression', 'sql_expression', 'sqlexpression']);
+  const nameKeys = ['name', 'field_name', 'fieldName', 'output_name', 'outputName', 'alias', 'target', 'column_name', 'columnName', 'technical_name', 'technicalName', 'field', 'column', 'member'];
+  const visited = new WeakSet<object>();
+  const scan = (value: unknown, parentKey = ''): void => {
+    // Some connectors embed sections of the metadata as JSON text. Parse
+    // those too; ordinary formula strings simply fail JSON parsing and are
+    // ignored by this branch.
+    if (typeof value === 'string') {
+      const text = value.trim();
+      if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
+        try { scan(JSON.parse(text), parentKey); } catch { /* Not a serialized metadata block. */ }
+      }
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (visited.has(value as object)) return;
+    visited.add(value as object);
+    if (Array.isArray(value)) {
+      value.forEach((item) => scan(item, parentKey));
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (/calculation|formula|expression/i.test(parentKey)) {
+      Object.entries(record).forEach(([fieldName, expression]) => {
+        if (typeof expression === 'string' && expression.trim() && !formulas[fieldName]) {
+          formulas[fieldName] = expression.trim();
+        }
+      });
+    }
+    const outputName = nameKeys.map((key) => record[key]).find((candidate) => typeof candidate === 'string' && candidate.trim());
+    if (typeof outputName === 'string') {
+      const formulaEntry = Object.entries(record).find(([key, candidate]) =>
+        formulaKeys.has(key.toLowerCase()) && typeof candidate === 'string' && candidate.trim(),
+      );
+      if (formulaEntry) {
+        const fieldName = String(outputName).trim();
+        if (!formulas[fieldName]) formulas[fieldName] = String(formulaEntry[1]).trim();
+      }
+    }
+    Object.entries(record).forEach(([key, child]) => scan(child, key));
+  };
+  scan(details);
+
   // 1. From metadata_json.calculated_columns
   const metaCalcs = details.metadata_json?.calculated_columns;
   if (Array.isArray(metaCalcs)) {
@@ -554,6 +601,8 @@ function compareRetrievedPromptResults(
 export default function AnalyticsDashboard() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [workflowStep, setWorkflowStep] = useState(0);
+  const [workflowRunning, setWorkflowRunning] = useState(false);
+  const [workflowComplete, setWorkflowComplete] = useState(false);
   // ---------------------------------------------------------------------------
   // Workspace & Catalog State
   // ---------------------------------------------------------------------------
@@ -598,7 +647,9 @@ export default function AnalyticsDashboard() {
   const [replicaCsvBusy, setReplicaCsvBusy] = useState(false);
   const [replicaCsvResult, setReplicaCsvResult] = useState<any>(null);
   const [replicaCsvError, setReplicaCsvError] = useState<string | null>(null);
-  const [replicaMetadataConfirmed, setReplicaMetadataConfirmed] = useState(false);
+  const [joinedSourceBusy, setJoinedSourceBusy] = useState(false);
+  const [joinedSourceResult, setJoinedSourceResult] = useState<any>(null);
+  const [joinedSourceError, setJoinedSourceError] = useState<string | null>(null);
   const sourceStageRequestId = useRef(0);
 
   // ---------------------------------------------------------------------------
@@ -654,11 +705,92 @@ export default function AnalyticsDashboard() {
   }, [viewDetails]);
 
   const validationFactView = useMemo(() => {
-    const factView = viewDetails?.lineage_chain?.find((step) =>
-      /fact|underlying/i.test(`${step.role} ${step.type}`) || /^FV[_-]/i.test(step.name),
+    const lineage = viewDetails?.lineage_chain || [];
+    // Datasphere often reports the fact view simply as a `view` with the
+    // relationship `analytic_model_source` (for example L3_FACT_*), rather
+    // than labeling its object type `fact_model` or using an FV_ name.
+    const factView = lineage.find((step) =>
+      String(step.role || '').toLowerCase() === 'analytic_model_source',
+    ) || lineage.find((step) =>
+      /^FV[_-]/i.test(step.name) || /fact[_\s-]*model/i.test(step.type),
+    ) || lineage.find((step) => /fact\s*view/i.test(step.role)) || lineage.find((step) =>
+      /fact|underlying/i.test(`${step.role} ${step.type}`),
     );
     return factView?.name || '';
   }, [viewDetails]);
+
+  const automaticKpiStatistics = useMemo(() => {
+    const factRows = factDataResult?.data as Array<Record<string, unknown>> | undefined;
+    const cdsRows = replicaCsvResult?.rows as Array<Record<string, unknown>> | undefined;
+    if (!factRows?.length || !cdsRows?.length || !viewDetails?.fields?.length) return [];
+
+    const readValues = (rows: Array<Record<string, unknown>>, fieldName: string) => {
+      const normalized = fieldName.trim().toLowerCase();
+      const key = Object.keys(rows[0] || {}).find((column) => column.trim().toLowerCase() === normalized);
+      return key ? rows.map((row) => row[key]) : null;
+    };
+    const numericValue = (value: unknown): number | null => {
+      if (value === null || value === undefined || String(value).trim() === '') return null;
+      const parsed = Number(String(value).replace(/,/g, '').trim());
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const makeStatistics = (values: unknown[], numeric: boolean) => {
+      const present = values.filter((value) => value !== null && value !== undefined && String(value).trim() !== '');
+      if (numeric) {
+        const numbers = present.map(numericValue).filter((value): value is number => value !== null);
+        if (!numbers.length) return null;
+        return {
+          kind: 'numeric' as const,
+          count: numbers.length,
+          sum: numbers.reduce((sum, value) => sum + value, 0),
+          average: numbers.reduce((sum, value) => sum + value, 0) / numbers.length,
+          min: Math.min(...numbers),
+          max: Math.max(...numbers),
+        };
+      }
+      return {
+        kind: 'text' as const,
+        count: present.length,
+        distinct: new Set(present.map((value) => String(value).trim())).size,
+      };
+    };
+    const sameNumber = (left: number, right: number) =>
+      Math.abs(left - right) <= Math.max(0.000001, Math.max(Math.abs(left), Math.abs(right)) * 0.000001);
+
+    const projectedFields = viewDetails.fields.filter((field: any) =>
+      field.selected !== false && field.is_selected !== false && field.projected !== false,
+    );
+    return projectedFields.flatMap((field: any) => {
+      const datasphereValues = readValues(factRows, field.name);
+      const cdsValues = readValues(cdsRows, field.name);
+      if (!datasphereValues || !cdsValues) return [];
+      const declaredType = [field.type, field.data_type, field.dataType, field.edm_type, field.edmType]
+        .filter(Boolean).join(' ').toLowerCase();
+      const isMeasure = field.category === 'measure' || field.is_measure || field.aggregation || field.measure_type;
+      const declaredNumeric = /int|decimal|double|float|numeric|number|real|long|short|byte|uint|bigint/.test(declaredType);
+      const declaredText = /string|char|text|date|time|bool|binary|uuid/.test(declaredType);
+      const valuesAreNumeric = (values: unknown[]) => {
+        const present = values.filter((value) => value !== null && value !== undefined && String(value).trim() !== '');
+        return present.length > 0 && present.every((value) => numericValue(value) !== null);
+      };
+      // Explicit source types decide first, avoiding numeric-looking document
+      // identifiers being treated as measures. Infer only when type metadata
+      // is absent or inconclusive, and require both systems to agree.
+      const numeric = isMeasure || declaredNumeric ||
+        (!declaredText && valuesAreNumeric(datasphereValues) && valuesAreNumeric(cdsValues));
+      if (!numeric) return [];
+      const datasphere = makeStatistics(datasphereValues, numeric);
+      const cds = makeStatistics(cdsValues, numeric);
+      if (!datasphere || !cds) return [];
+      const matched = datasphere.kind === 'numeric' && cds.kind === 'numeric'
+        ? datasphere.count === cds.count && sameNumber(datasphere.sum, cds.sum) &&
+          sameNumber(datasphere.average, cds.average) && sameNumber(datasphere.min, cds.min) &&
+          sameNumber(datasphere.max, cds.max)
+        : datasphere.kind === 'text' && cds.kind === 'text' &&
+          datasphere.count === cds.count && datasphere.distinct === cds.distinct;
+      return [{ name: field.name, type: 'Numeric field', datasphere, cds, matched }];
+    });
+  }, [factDataResult?.data, replicaCsvResult?.rows, viewDetails?.fields]);
 
   useEffect(() => {
     if (activeTab !== 'validation' || !replicaCsvResult || !validationFactView) return;
@@ -671,6 +803,7 @@ export default function AnalyticsDashboard() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         view_name: validationFactView,
+        view_names: [validationFactView],
         space_id: viewDetails?.space_id || spaceId,
         user_prompt: `Retrieve all rows and fields from ${validationFactView}`,
         raw_view_preview: true,
@@ -691,6 +824,12 @@ export default function AnalyticsDashboard() {
       .finally(() => { if (!cancelled) setFactDataLoading(false); });
     return () => { cancelled = true; };
   }, [activeTab, replicaCsvResult, validationFactView, viewDetails?.space_id, viewDetails?.fields, spaceId, factDataReloadKey]);
+
+  useEffect(() => {
+    if (!workflowRunning && replicaCsvResult && !factDataLoading && (factDataResult || factDataError || !validationFactView)) {
+      setWorkflowComplete(true);
+    }
+  }, [workflowRunning, replicaCsvResult, factDataLoading, factDataResult, factDataError, validationFactView]);
 
   const toggleModelField = (fieldName: string) => {
     setSelectedFields(prev =>
@@ -764,9 +903,9 @@ export default function AnalyticsDashboard() {
   const fetchCdsSourceRows = async (
     details: ViewDetails,
     sourceNames: string[],
-  ) => {
+  ): Promise<any[]> => {
     const uniqueNames = Array.from(new Set(sourceNames.filter(Boolean)));
-    if (!uniqueNames.length) return;
+    if (!uniqueNames.length) return [];
     const requestId = ++sourceStageRequestId.current;
     setStagingCds(true);
     setStagingError(null);
@@ -776,7 +915,8 @@ export default function AnalyticsDashboard() {
     setStagedSqlExecution(null);
     setReplicaCsvResult(null);
     setReplicaCsvError(null);
-    setReplicaMetadataConfirmed(false);
+    setJoinedSourceResult(null);
+    setJoinedSourceError(null);
     const selectedSources = (details.sources || [])
       .filter((source) => source.matched_cds_view && uniqueNames.includes(source.matched_cds_view));
     try {
@@ -790,20 +930,23 @@ export default function AnalyticsDashboard() {
       });
       const body = await response.json().catch(() => null);
       if (!response.ok) throw new Error(typeof body?.detail === 'string' ? body.detail : `HTTP ${response.status}: ADT source read failed.`);
-      if (sourceStageRequestId.current !== requestId) return;
+      if (sourceStageRequestId.current !== requestId) return [];
       const staged = body?.staged_sources || [];
       setStagingResults(staged);
       setStagingErrors(body?.failed_sources || []);
       if (!staged.length || body?.status === 'FAILED' || body?.status === 'PARTIAL_FAILURE') {
         setStagingError('At least one CDS source could not be read completely from ADT; the replica was not built.');
-        return;
+        return [];
       }
-
-      if (body?.status === 'FAILED' || body?.status === 'PARTIAL_FAILURE') {
-        setStagingError('The primary CDS source could not be read completely from ADT. Review the source error before continuing.');
+      const stagedNames = new Set(staged.map((item: any) => String(item.source || '').toLowerCase()));
+      if (uniqueNames.some((name) => !stagedNames.has(name.toLowerCase()))) {
+        setStagingError('Not all resolved CDS sources were staged, so the joined replica was not built.');
+        return [];
       }
+      return staged;
     } catch (error: any) {
       if (sourceStageRequestId.current === requestId) setStagingError(error.message || 'Failed to retrieve CDS source data and build the replica.');
+      return [];
     } finally {
       if (sourceStageRequestId.current === requestId) setStagingCds(false);
     }
@@ -814,6 +957,8 @@ export default function AnalyticsDashboard() {
   // ---------------------------------------------------------------------------
   const handleSelectView = async (viewName: string, targetSpace?: string, forceRefresh = false) => {
     setWorkflowStep(0);
+    setWorkflowRunning(true);
+    setWorkflowComplete(false);
     setActiveTab('lineage');
     setActiveLineageStep(null);
     sourceStageRequestId.current += 1;
@@ -833,7 +978,6 @@ export default function AnalyticsDashboard() {
     setStagedSqlExecution(null);
     setReplicaCsvResult(null);
     setReplicaCsvError(null);
-    setReplicaMetadataConfirmed(false);
     setLoadingDetails(true);
     setDetailsError(null);
     const space = targetSpace || spaceId;
@@ -868,16 +1012,40 @@ export default function AnalyticsDashboard() {
       const fallbackKeys = declaredKeys.length > 0 ? declaredKeys : sourceKeys;
       setValDimension(fallbackKeys.join(', '));
 
-      // Initialize primary matched CDS source & trigger field comparison
+      // Resolve model sources and metadata-driven formula suggestions.
       const primarySource = (data.sources || []).find((source) => Boolean(source.matched_cds_view));
       const resolvedCds = primarySource?.matched_cds_view || '';
+      const resolvedSourceNames = Array.from(new Set(
+        (data.sources || [])
+          .map((source) => source.matched_cds_view)
+          .filter((source): source is string => Boolean(source)),
+      ));
       setSelectedSourceCds(resolvedCds || null);
       if (resolvedCds) loadFieldComparison(viewName, resolvedCds, data);
 
-      setSelectedCdsForStaging(resolvedCds ? [resolvedCds] : []);
-      if (!resolvedCds) {
-        setStagingError('No primary CDS source was resolved for this Datasphere model.');
+      setSelectedCdsForStaging(resolvedSourceNames);
+      setJoinedSourceResult(null);
+      setJoinedSourceError(null);
+      setStagingError(resolvedSourceNames.length ? '' : 'No CDS sources were resolved for this Datasphere model.');
+      if (!resolvedSourceNames.length) throw new Error('No CDS sources were resolved for this Datasphere model.');
+
+      // Model selection is the only user action. Complete each validation
+      // stage automatically, joining only when the model has multiple sources.
+      setWorkflowStep(1);
+      const staged = await fetchCdsSourceRows(data, resolvedSourceNames);
+      if (staged.length !== resolvedSourceNames.length) {
+        throw new Error('Could not retrieve every resolved CDS source from S/4HANA.');
       }
+      setWorkflowStep(3);
+      if (resolvedSourceNames.length > 1) {
+        const joined = await handleJoinStagedSources(data, viewName, staged);
+        if (!joined) throw new Error('Could not join the staged sources using the Datasphere model join conditions.');
+      }
+      setWorkflowStep(4);
+      const replica = await handleCreateReplicaCsv(staged, data, viewName, true);
+      if (!replica) throw new Error('Could not create the final CDS projection from the staged source data.');
+      setWorkflowStep(5);
+      setActiveTab('validation');
 
       // Default active lineage step to first node
       if (data.lineage_chain && data.lineage_chain.length > 0) {
@@ -885,8 +1053,10 @@ export default function AnalyticsDashboard() {
       }
     } catch (err: any) {
       console.error('Error fetching view details:', err);
-      setDetailsError(err.message || 'Failed to fetch view details');
+      setDetailsError(err.message || 'Failed to complete the automatic model validation workflow.');
+      setWorkflowComplete(false);
     } finally {
+      setWorkflowRunning(false);
       setLoadingDetails(false);
     }
   };
@@ -970,32 +1140,68 @@ export default function AnalyticsDashboard() {
     setSelectedFields([]);
   };
 
-  const handleStageSelectedCds = async (requestedSources: string[] = selectedCdsForStaging) => {
-    if (!selectedViewName || !viewDetails || requestedSources.length === 0 || stagingCds) return;
-    await fetchCdsSourceRows(viewDetails, requestedSources);
+  const handleJoinStagedSources = async (details: ViewDetails, viewName: string, stagedRows: any[]) => {
+    const sourceNames = Array.from(new Set((details.sources || []).map((source) => source.matched_cds_view).filter((source): source is string => Boolean(source))));
+    if (!sourceNames.length || sourceNames.some((name) => !stagedRows.some((item) => String(item.source || '').toLowerCase() === name.toLowerCase()))) return;
+    setJoinedSourceBusy(true);
+    setJoinedSourceError(null);
+    setJoinedSourceResult(null);
+    try {
+      const response = await fetch('/api/cds-staging/joined-csv', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          space_id: details.space_id || spaceId,
+          view_name: viewName,
+          source_names: sourceNames,
+          projection_fields: (details.fields || []).filter((field) => field.name),
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(typeof body?.detail === 'string' ? body.detail : `HTTP ${response.status}: Could not join staged CDS sources.`);
+      setJoinedSourceResult(body);
+      return body;
+    } catch (error: any) {
+      setJoinedSourceError(error.message || 'Could not join the staged CDS source datasets.');
+      return null;
+    } finally {
+      setJoinedSourceBusy(false);
+    }
   };
 
-  const handleCreateReplicaCsv = async () => {
-    if (!selectedSourceCds || !viewDetails || !replicaMetadataConfirmed || replicaCsvBusy) return;
+  const handleCreateReplicaCsv = async (
+    stagedOverride?: any[],
+    detailsOverride: ViewDetails | null = viewDetails,
+    viewNameOverride: string | null = selectedViewName,
+    automatic = false,
+  ) => {
+    const stagedRows = stagedOverride || stagingResults;
+    const details = detailsOverride;
+    const stagedSourceNames = Array.from(new Set((details?.sources || []).map((source) => source.matched_cds_view).filter((source): source is string => Boolean(source))));
+    if (!stagedSourceNames.length || !details
+      || stagedSourceNames.some((name) => !stagedRows.some((item) => item.source.toLowerCase() === name.toLowerCase()))) return;
     setReplicaCsvBusy(true);
     setReplicaCsvError(null);
     setReplicaCsvResult(null);
     const formulas: Record<string, string> = {
-      ...getCalculatedFieldFormulas(viewDetails),
-      ...fieldFormulas,
+      ...getCalculatedFieldFormulas(details),
+      ...(automatic ? {} : fieldFormulas),
     };
-    fieldComparison?.new_fields?.forEach((field) => {
+    (automatic ? [] : fieldComparison?.new_fields || []).forEach((field) => {
       if (field.suggested_formula && !formulas[field.name]) formulas[field.name] = field.suggested_formula;
     });
-    customNewFields.forEach((field) => {
+    // Datasphere exposes measure base members with the _M_base suffix. If
+    // that member omits its own expression, use its matching measure formula
+    // from this model's metadata.
+    (details.fields || []).forEach((field: any) => {
+      const name = String(field.name || '');
+      const baseName = name.replace(/_M_base$/i, '');
+      if (baseName !== name && !formulas[name] && formulas[baseName]) formulas[name] = formulas[baseName];
+    });
+    (automatic ? [] : customNewFields).forEach((field) => {
       if (field.name.trim() && field.formula.trim()) formulas[field.name.trim()] = field.formula.trim();
     });
-    const factViewNode = (viewDetails.lineage_analysis?.items || []).find((node: any) =>
-      String(node.name || '').toLowerCase() === validationFactView.toLowerCase(),
-    );
-    const factViewFields = (factViewNode?.field_catalog || []).map((field: any) => field.name).filter(Boolean);
     const replicaProjection = Array.from(new Map(
-      [...factViewFields, ...(viewDetails.fields || []).map((field: any) => field.name)]
+      (details.fields || []).map((field: any) => field.name)
         .filter(Boolean)
         .map((name: string) => [name.toLowerCase(), name]),
     ).values());
@@ -1003,11 +1209,12 @@ export default function AnalyticsDashboard() {
       const response = await fetch('/api/cds-staging/replica-csv', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          space_id: viewDetails.space_id || spaceId,
-          view_name: selectedViewName,
+          space_id: details.space_id || spaceId,
+          view_name: viewNameOverride,
           source_name: selectedSourceCds,
-          // The final Datasphere model projection is authoritative for both
-          // field selection and filter parity in the exported CDS replica.
+          source_names: stagedSourceNames,
+          // The selected model's final projection is authoritative; the
+          // backend resolves its Datasphere joins and calculations from metadata.
           selected_fields: replicaProjection,
           calculated_fields: formulas,
         }),
@@ -1026,13 +1233,16 @@ export default function AnalyticsDashboard() {
       } catch (error) {
         console.warn('Could not load the complete final CDS CSV for prompt validation:', error);
       }
-      setReplicaCsvResult({
+      const result = {
         ...body,
         rows: finalRows,
         rows_complete: finalRows.length === Number(body?.row_count),
-      });
+      };
+      setReplicaCsvResult(result);
+      return result;
     } catch (error: any) {
       setReplicaCsvError(error.message || 'Could not create the CDS replica CSV.');
+      return null;
     } finally {
       setReplicaCsvBusy(false);
     }
@@ -1103,15 +1313,23 @@ export default function AnalyticsDashboard() {
       }
     });
 
-    const activeFields = (selectedFields && selectedFields.length > 0)
+    const requestedActiveFields = (selectedFields && selectedFields.length > 0)
       ? selectedFields
       : (viewDetails?.fields?.map(f => f.name) || ['Product', 'GrossWeight', 'MaterialVolume', 'weight']);
+    const replicaColumns = new Set((replicaCsvResult?.columns || []).map((name: string) => name.toLowerCase()));
+    const activeFields = requestedActiveFields.filter((name) => replicaColumns.has(String(name).toLowerCase()));
+    if (!activeFields.length) {
+      setValidationError('No selected Datasphere fields are available in the final CDS projection. Create the projection with at least one shared field before calculating statistics.');
+      setValidating(false);
+      return;
+    }
 
     const declaredKeys = (viewDetails?.fields || []).filter((f: any) => f.is_key).map((f: any) => f.name);
     const sourceKeys = viewDetails?.sources?.flatMap((s: any) => s.key_fields || []).filter(Boolean) || [];
-    const activeKeys = valDimension
+    const requestedKeys = valDimension
       ? valDimension.split(',').map((field) => field.trim()).filter(Boolean)
       : (declaredKeys.length > 0 ? declaredKeys : sourceKeys);
+    const activeKeys = requestedKeys.filter((name) => replicaColumns.has(String(name).toLowerCase()));
 
     let cdsParameters: Record<string, unknown> = {};
     if (cdsParametersText.trim()) {
@@ -1138,7 +1356,7 @@ export default function AnalyticsDashboard() {
       calculated_field_formulas: combinedFormulas,
       selected_metrics: activeFields,
       selected_fields: activeFields,
-      reconciliation_dimension: valDimension || (activeKeys.length > 0 ? activeKeys.join(', ') : undefined),
+      reconciliation_dimension: activeKeys.length > 0 ? activeKeys.join(', ') : undefined,
       key_fields: activeKeys,
       custom_filters: valCustomFilter || undefined,
       human_approved: approved,
@@ -1452,7 +1670,11 @@ export default function AnalyticsDashboard() {
     });
 
     const allKeys = new Set([...datasphereGroups.keys(), ...cdsGroups.keys()]);
-    const rows = Array.from(allKeys, (key) => {
+    const rows: Array<{
+      key: string; keyValues: unknown[]; datasphereRecords: Array<Record<string, any>>;
+      cdsRecords: Array<Record<string, any>>; datasphere: Record<string, any> | null;
+      cds: Record<string, any> | null; datasphereCount: number; cdsCount: number; status: string;
+    }> = Array.from(allKeys, (key) => {
       const dsRecords = datasphereGroups.get(key) || [];
       const cdsRecords = cdsGroups.get(key) || [];
       const duplicateKey = dsRecords.length > 1 || cdsRecords.length > 1;
@@ -1848,6 +2070,35 @@ export default function AnalyticsDashboard() {
                 {/* TAB 1: DATA VALIDATION STUDIO (OUR MAJOR GOAL) */}
                 {activeTab === 'validation' && (
                   <div id="workflow-validation" className="space-y-6 max-w-6xl mx-auto">
+
+                    <section className="overflow-hidden rounded-2xl border border-blue-200 bg-gradient-to-br from-white via-blue-50 to-emerald-50 shadow-sm">
+                      <div className="border-b border-blue-100 px-5 py-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <h2 className="text-lg font-bold text-slate-900">Automatic validation report</h2>
+                            <p className="mt-1 text-sm text-slate-600">Model selection starts the complete retrieval, projection, and comparison flow.</p>
+                          </div>
+                          <span className={`rounded-full px-3 py-1 text-xs font-bold ${workflowComplete ? (factDataError ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800') : 'bg-blue-100 text-blue-800'}`}>
+                            {workflowComplete ? (factDataError || !validationFactView ? 'Completed with fact retrieval issue' : 'Validation complete') : workflowRunning || factDataLoading ? 'In progress' : 'Preparing report'}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 p-4 md:grid-cols-3 xl:grid-cols-6">
+                        {(selectedCdsForStaging.length > 1 ? ['Model metadata', 'Resolve sources', 'Stage CDS data', 'Join sources', 'Apply calculations', 'Final projection'] : ['Model metadata', 'Resolve source', 'Stage CDS data', 'Project source', 'Apply calculations', 'Final projection']).map((label, index) => {
+                          const done = workflowComplete || index < workflowStep;
+                          const current = !done && index === workflowStep && (workflowRunning || factDataLoading);
+                          return <div key={label} className={`rounded-xl border px-3 py-3 text-xs font-semibold ${done ? 'border-emerald-200 bg-white text-emerald-800' : current ? 'border-blue-200 bg-white text-blue-800' : 'border-slate-200 bg-white/70 text-slate-500'}`}>
+                            <div className="mb-1 text-base">{done ? '✓' : current ? '…' : index + 1}</div>{label}
+                          </div>;
+                        })}
+                      </div>
+                      <div className="grid gap-3 px-4 pb-4 sm:grid-cols-2 xl:grid-cols-4">
+                        <div className="rounded-xl bg-white/90 px-4 py-3"><div className="text-xs text-slate-500">Final CDS rows</div><div className="mt-1 text-lg font-bold text-slate-900">{Number(replicaCsvResult?.row_count || 0).toLocaleString()}</div></div>
+                        <div className="rounded-xl bg-white/90 px-4 py-3"><div className="text-xs text-slate-500">Fact model rows</div><div className="mt-1 text-lg font-bold text-slate-900">{factDataLoading ? 'Retrieving…' : Number(factDataResult?.data?.length || 0).toLocaleString()}</div></div>
+                        <div className="rounded-xl bg-white/90 px-4 py-3"><div className="text-xs text-slate-500">Numeric KPI fields compared</div><div className="mt-1 text-lg font-bold text-slate-900">{automaticKpiStatistics.length}</div></div>
+                        <div className="rounded-xl bg-white/90 px-4 py-3"><div className="text-xs text-slate-500">KPI statistics matched</div><div className="mt-1 text-lg font-bold text-slate-900">{automaticKpiStatistics.filter((item: any) => item.matched).length} / {automaticKpiStatistics.length}</div></div>
+                      </div>
+                    </section>
 
                     <div className="hidden">
 
@@ -2447,14 +2698,51 @@ export default function AnalyticsDashboard() {
                               <tbody>{factDataResult.data.map((row: Record<string, unknown>, index: number) => <tr key={index} className="border-t border-slate-100 text-slate-700">{Object.keys(factDataResult.data[0]).map((column: string) => <td key={column} className="max-w-xs truncate px-3 py-2" title={String(row[column] ?? '')}>{String(row[column] ?? '')}</td>)}</tr>)}</tbody>
                             </table>
                           </div>
-                        ) : <p className="mt-3 text-xs text-slate-500">No fact rows were returned from Datasphere.</p>}
+                        ) : <div className="mt-3 space-y-2 text-xs text-slate-500">
+                          <p>No fact rows were returned from Datasphere.</p>
+                          {factDataResult && <details className="rounded-md border border-slate-200 bg-white p-2">
+                            <summary className="cursor-pointer font-semibold">Inspect fact query target</summary>
+                            <div className="mt-2 space-y-1">
+                              <div>Requested fact view: <code>{validationFactView || 'unresolved'}</code></div>
+                              <div>Executed view: <code>{factDataResult.execution_info?.view_name || 'not reported'}</code></div>
+                              <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-slate-50 p-2">{factDataResult.query_blueprint?.sql_query || 'SQL was not returned.'}</pre>
+                            </div>
+                          </details>}
+                        </div>}
                         {factDataResult?.query_blueprint?.unavailable_on_fact_view?.length > 0 && (
                           <p className="mt-2 text-xs text-slate-600">The fact view returned its available technical input fields. Calculated model fields are returned by the model query during validation.</p>
                         )}
                       </details>
 
+                      <section className="space-y-4 rounded-xl border border-blue-200 bg-gradient-to-br from-white via-blue-50 to-indigo-50 p-4 shadow-sm">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <h3 className="text-base font-bold text-slate-900">Automatic KPI statistics</h3>
+                            <p className="mt-1 text-xs text-slate-600">Computed as soon as the selected fact model and final CDS projection are retrieved. No prompt or row matching is needed.</p>
+                          </div>
+                          <span className="rounded-full bg-blue-100 px-3 py-1 text-xs font-semibold text-blue-800">{automaticKpiStatistics.length} KPI columns</span>
+                        </div>
+                        {factDataLoading ? <p className="rounded-lg bg-white/80 px-3 py-3 text-sm text-slate-600">Retrieving fact-model data to calculate statistics…</p> : automaticKpiStatistics.length ? <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+                          <table className="min-w-full text-left text-xs">
+                            <thead className="bg-slate-100 text-slate-600"><tr><th className="px-3 py-3">KPI column</th><th className="px-3 py-3">Data type</th><th className="px-3 py-3">Datasphere statistics</th><th className="px-3 py-3">CDS statistics</th><th className="px-3 py-3">Matching</th></tr></thead>
+                            <tbody>{automaticKpiStatistics.map((item: any) => {
+                              const format = (value: number) => Number(value).toLocaleString(undefined, { maximumFractionDigits: 4 });
+                              const summarize = (stats: any) => stats.kind === 'numeric'
+                                ? `Sum ${format(stats.sum)} · Avg ${format(stats.average)} · Min ${format(stats.min)} · Max ${format(stats.max)} · Count ${format(stats.count)}`
+                                : `Count ${format(stats.count)} · Distinct ${format(stats.distinct)}`;
+                              return <tr key={item.name} className="border-t border-slate-100">
+                                <td className="whitespace-nowrap px-3 py-3 font-mono font-semibold text-slate-900">{item.name}</td>
+                                <td className="whitespace-nowrap px-3 py-3 text-slate-600">{item.type}</td>
+                                <td className="min-w-64 px-3 py-3 text-slate-700">{summarize(item.datasphere)}</td>
+                                <td className="min-w-64 px-3 py-3 text-slate-700">{summarize(item.cds)}</td>
+                                <td className="px-3 py-3"><span className={`inline-flex rounded-full px-2.5 py-1 font-bold ${item.matched ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}`}>{item.matched ? 'Matched' : 'Not matched'}</span></td>
+                              </tr>;
+                            })}</tbody>
+                          </table>
+                        </div> : <p className="rounded-lg bg-white/80 px-3 py-3 text-sm text-slate-600">{factDataError ? `Fact-model retrieval failed: ${factDataError}` : 'No KPI columns are available in both retrieved datasets yet.'}</p>}
+                      </section>
                       <label className="block space-y-2">
-                        <span className="text-sm font-semibold text-slate-800">Validation prompt</span>
+                        <span className="text-sm font-semibold text-slate-800">Optional follow-up prompt</span>
                         <textarea
                           value={valPrompt}
                           onChange={(event) => {
@@ -3690,12 +3978,22 @@ export default function AnalyticsDashboard() {
                     <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
                       <div className="mb-2 flex items-center justify-between gap-3">
                         <div className="text-sm font-semibold text-slate-800">CDS replication workflow</div>
-                        <div className="text-xs text-slate-500">Step {workflowStep + 1} of 5</div>
+                        <div className="text-xs text-slate-500">Step {workflowStep + 1} of 6</div>
                       </div>
                       <div className="h-1.5 overflow-hidden rounded-full bg-slate-100">
-                        <div className="h-full rounded-full bg-blue-600 transition-all" style={{ width: `${((workflowStep + 1) / 5) * 100}%` }} />
+                        <div className="h-full rounded-full bg-blue-600 transition-all" style={{ width: `${((workflowStep + 1) / 6) * 100}%` }} />
                       </div>
-                      <div className="mt-2 text-xs text-slate-500">{['Review lineage', 'Choose primary source', 'Retrieve source data', 'Discover calculations', 'Create CDS replica'][workflowStep]}</div>
+                      <div className="mt-2 text-xs text-slate-500">{(selectedCdsForStaging.length > 1 ? ['Review lineage', 'Resolve model sources', 'Stage all CDS sources', 'Join staged source datasets', 'Apply calculated fields', 'Create final model projection'] : ['Review lineage', 'Resolve model sources', 'Stage CDS source', 'Project single source', 'Apply calculated fields', 'Create final model projection'])[workflowStep]}</div>
+                      <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-6">
+                        {(selectedCdsForStaging.length > 1 ? ['Model metadata', 'Resolve sources', 'Stage CDS data', 'Join and project', 'Apply calculations', 'Final projection'] : ['Model metadata', 'Resolve source', 'Stage CDS data', 'Project source', 'Apply calculations', 'Final projection']).map((label, index) => (
+                          <div key={label} className={`rounded-lg border px-2 py-2 text-left text-[11px] font-semibold transition-colors ${workflowComplete || index < workflowStep ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : index === workflowStep ? 'border-blue-300 bg-blue-50 text-blue-800' : 'border-slate-200 bg-slate-50 text-slate-400'}`}>
+                            <span className="mr-1 font-mono">{workflowComplete || index < workflowStep ? '✓' : index === workflowStep && workflowRunning ? '…' : index + 1}</span>{label}
+                          </div>
+                        ))}
+                      </div>
+                      <div className={`rounded-lg px-3 py-2 text-xs font-medium ${workflowComplete ? 'bg-emerald-50 text-emerald-800' : workflowRunning ? 'bg-blue-50 text-blue-800' : 'bg-rose-50 text-rose-800'}`}>
+                        {workflowComplete ? 'All workflow steps completed. The automatic validation report is ready below.' : workflowRunning ? 'Running the complete metadata, source retrieval, projection, and validation workflow…' : 'The workflow stopped before completion. See the error details above.'}
+                      </div>
                     </div>
                     
                     {/* Visual Lineage Pipeline */}
@@ -3781,9 +4079,7 @@ export default function AnalyticsDashboard() {
                       )}
                     </div>}
 
-                    {workflowStep === 0 && <div className="flex justify-end">
-                      <button type="button" onClick={() => setWorkflowStep(1)} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">Continue to primary source</button>
-                    </div>}
+                    {workflowStep === 0 && <div className="text-right text-xs text-slate-500">Model metadata is processed automatically after selection.</div>}
 
                     {/* Upstream Sources Section */}
                     {workflowStep > 0 && <div id="workflow-sources" className="p-6 rounded-2xl bg-[#0e1629] border border-slate-800 shadow-xl space-y-4">
@@ -3791,17 +4087,17 @@ export default function AnalyticsDashboard() {
                       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3">
                         <div className="flex items-center gap-2">
                           <Boxes className="w-4 h-4 text-emerald-400" />
-                          <h3 className="font-bold text-sm text-white">Primary CDS Source for {selectedViewName}</h3>
+                          <h3 className="font-bold text-sm text-white">CDS Source Datasets for {selectedViewName}</h3>
                         </div>
                         <div className="flex items-center gap-3">
                           <span className="text-[11px] font-mono text-slate-400">
-                            {selectedSourceCds ? '1 primary source' : 'No primary source found'}
+                            {new Set((viewDetails.sources || []).map((source) => source.matched_cds_view).filter(Boolean)).size} resolved sources
                           </span>
                         </div>
                       </div>
 
                       <p className="text-[11px] text-slate-400">
-                        Select a model to resolve its primary CDS source. Click the button to read it with a plain SELECT * through configured S/4HANA ADT. Only the first 1,000 raw rows are displayed; source extraction does not use keys or keyset paging.
+                        Retrieve every CDS source resolved from this model’s Datasphere lineage. Each source is fetched from S/4HANA ADT and shown below.
                       </p>
                       {stagingCds && (
                           <div className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-900">
@@ -3860,7 +4156,11 @@ export default function AnalyticsDashboard() {
                             onClick={() => {
                               const cdsName = source.matched_cds_view || null;
                               setSelectedSourceCds(cdsName);
-                              setSelectedCdsForStaging(cdsName ? [cdsName] : []);
+                              setSelectedCdsForStaging(Array.from(new Set(
+                                (viewDetails.sources || [])
+                                  .map((item) => item.matched_cds_view)
+                                  .filter((item): item is string => Boolean(item)),
+                              )));
                               setStagingResults([]);
                               setStagingErrors([]);
                               setStagingError(null);
@@ -3868,7 +4168,6 @@ export default function AnalyticsDashboard() {
                               setStagedSqlExecution(null);
                               setReplicaCsvResult(null);
                               setReplicaCsvError(null);
-                              setReplicaMetadataConfirmed(false);
                               if (selectedViewName && cdsName) loadFieldComparison(selectedViewName, cdsName, viewDetails);
                             }}
                                       className={`px-2.5 py-1 rounded text-[11px] font-bold cursor-pointer transition-colors ${
@@ -3887,20 +4186,23 @@ export default function AnalyticsDashboard() {
                         })}
                       </div>
                       <div className="flex justify-between border-t border-slate-200 pt-4">
-                        <button type="button" onClick={() => setWorkflowStep(0)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">Back to lineage</button>
-                        <button type="button" disabled={stagingCds || !selectedSourceCds} onClick={() => { if (selectedSourceCds) { void handleStageSelectedCds([selectedSourceCds]); setWorkflowStep(2); } }} className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300">
-                          <RefreshCw className={`h-4 w-4 ${stagingCds ? 'animate-spin' : ''}`} />
-                          {stagingCds ? 'Retrieving source data…' : 'Get primary source data'}
+                        <button type="button" disabled={stagingCds || !(viewDetails.sources || []).some((source) => source.matched_cds_view)} onClick={() => {
+                          const sourceNames = Array.from(new Set((viewDetails.sources || []).map((source) => source.matched_cds_view).filter((source): source is string => Boolean(source))));
+                          setSelectedCdsForStaging(sourceNames);
+                          setWorkflowStep(2);
+                        }} className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300">
+                          <CheckCircle2 className="h-4 w-4" />
+                          Sources are resolved automatically from model metadata.
                         </button>
                       </div>
                       </>}
 
                       {workflowStep === 2 && <>
                       <div className="mb-3 border-b border-slate-200 pb-3">
-                        <h3 className="text-base font-semibold text-slate-900">Primary source data</h3>
-                        <p className="mt-1 text-xs text-slate-500">{selectedSourceCds} · preview rows can be expanded below.</p>
+                        <h3 className="text-base font-semibold text-slate-900">Staged CDS source datasets</h3>
+                        <p className="mt-1 text-xs text-slate-500">All resolved sources are listed below. Expand a preview to inspect each source’s retrieved rows.</p>
                       </div>
-                      {stagingCds && <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">Retrieving source data from S/4HANA ADT…</div>}
+                      {stagingCds && <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">Retrieving all resolved source datasets from S/4HANA ADT…</div>}
                       {stagingError && (
                         <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
                           {stagingError}
@@ -3962,22 +4264,81 @@ export default function AnalyticsDashboard() {
                         </div>
                       ))}
                       <div className="flex justify-between border-t border-slate-200 pt-4">
-                        <button type="button" onClick={() => setWorkflowStep(1)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">Back to source</button>
-                        <button type="button" disabled={!stagingResults.some((item) => item.source.toLowerCase() === (selectedSourceCds || '').toLowerCase()) || stagingCds} onClick={() => { if (selectedViewName && selectedSourceCds) void loadFieldComparison(selectedViewName, selectedSourceCds, viewDetails); setWorkflowStep(3); }} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300">Discover calculation columns</button>
+                        <div className="flex flex-wrap justify-end gap-2">
+                          <span className="text-xs text-slate-500">CDS sources are retrieved automatically after model selection.</span>
+                        </div>
                       </div>
                       </>}
-                      {workflowStep === 3 && selectedSourceCds && stagingResults.some((item) => item.source.toLowerCase() === selectedSourceCds.toLowerCase()) && <>
+                      {workflowStep === 3 && <div className="space-y-4 rounded-xl border border-blue-200 bg-white p-4">
+                        <div>
+                          <h3 className="text-base font-semibold text-slate-900">Datasphere final view projection</h3>
+                          <p className="mt-1 text-xs text-slate-600">The staged CDS sources are joined using Datasphere metadata, then restricted to the fields exposed by the selected final view.</p>
+                        </div>
+                        {joinedSourceBusy && <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">Joining staged CDS sources using the Datasphere join condition…</div>}
+                        {joinedSourceError && <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">{joinedSourceError}</div>}
+                        {joinedSourceResult && <>
+                          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-3">
+                            <div className="text-sm font-semibold text-emerald-900">Final view data · {joinedSourceResult.row_count} rows · {joinedSourceResult.columns?.length || 0} projected fields</div>
+                            {joinedSourceResult.download_url && <a href={joinedSourceResult.download_url} className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700">Download projected dataset</a>}
+                          </div>
+                          {!!joinedSourceResult.pending_calculated_fields?.length && <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">Calculated fields to be created in the next step: {joinedSourceResult.pending_calculated_fields.join(', ')}</div>}
+                          {!!joinedSourceResult.missing_calculation_metadata?.length && <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">No formula is attached directly to these output members; the calculation step will resolve matching base-measure formulas from the model metadata: {joinedSourceResult.missing_calculation_metadata.join(', ')}</div>}
+                          {!!joinedSourceResult.field_mappings?.length && <details className="rounded-lg border border-slate-200 bg-white" open>
+                            <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-slate-800">Final field mapping across all staged sources · {joinedSourceResult.field_mappings.length} fields</summary>
+                            <div className="max-h-56 overflow-auto border-t border-slate-100">
+                              <table className="min-w-full text-left text-xs">
+                                <thead className="sticky top-0 bg-slate-50 text-slate-600"><tr><th className="px-3 py-2">Final view field</th><th className="px-3 py-2">Found in</th><th className="px-3 py-2">Source field / handling</th></tr></thead>
+                                <tbody>{joinedSourceResult.field_mappings.map((mapping: { output_field: string; source: string; source_field: string; kind: string }) => <tr key={mapping.output_field} className="border-t border-slate-100"><td className="px-3 py-1.5 font-mono text-slate-800">{mapping.output_field}</td><td className="px-3 py-1.5 text-slate-700">{mapping.source}</td><td className="px-3 py-1.5 text-slate-700">{mapping.kind === 'calculated' ? 'Calculated from model metadata' : mapping.source_field}</td></tr>)}</tbody>
+                              </table>
+                            </div>
+                          </details>}
+                          {(joinedSourceResult.join_conditions || []).map((condition: string, index: number) => <div key={`${condition}-${index}`} className="rounded-md bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700">{condition}</div>)}
+                          {joinedSourceResult.preview?.length > 0 && <div className="max-h-[420px] overflow-auto rounded-lg border border-slate-200">
+                            <table className="min-w-full border-collapse text-left font-mono text-xs">
+                              <thead className="sticky top-0 bg-slate-100 text-slate-700"><tr>{joinedSourceResult.columns.map((column: string) => <th key={column} className="whitespace-nowrap border-b border-slate-200 px-3 py-2">{column}</th>)}</tr></thead>
+                              <tbody>{joinedSourceResult.preview.map((row: Record<string, unknown>, rowIndex: number) => <tr key={rowIndex} className="odd:bg-white even:bg-slate-50">{joinedSourceResult.columns.map((column: string) => <td key={column} className="whitespace-nowrap border-b border-slate-100 px-3 py-2 text-slate-700">{String(row[column] ?? '')}</td>)}</tr>)}</tbody>
+                            </table>
+                          </div>}
+                        </>}
+                        <div className="flex justify-between border-t border-slate-200 pt-4">
+                          <button type="button" onClick={() => setWorkflowStep(2)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">Back to staged sources</button>
+                          <div className="flex gap-2">
+                            <span className="text-xs text-slate-500">{selectedCdsForStaging.length > 1 ? 'Sources are joined using Datasphere metadata automatically.' : 'The single source is projected directly.'}</span>
+                          </div>
+                        </div>
+                      </div>}
+
+                      {workflowStep === 4 && selectedSourceCds && stagingResults.some((item) => item.source.toLowerCase() === selectedSourceCds.toLowerCase()) && <>
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3">
+                        <div>
+                          <h4 className="text-sm font-bold text-amber-950">Calculated measures from Datasphere metadata</h4>
+                          <p className="mt-1 text-xs text-amber-800">Review the source expressions and aggregations resolved for this model. A measure base member uses its matching formula when its own metadata entry has no expression.</p>
+                        </div>
+                        <div className="grid gap-2 md:grid-cols-2">
+                          {(viewDetails.fields || []).filter((field: any) => field.category === 'measure').map((field: any) => {
+                            const formulas = getCalculatedFieldFormulas(viewDetails);
+                            const name = String(field.name || '');
+                            const baseName = name.replace(/_M_base$/i, '');
+                            const formula = field.calculation || field.expression || formulas[name] || formulas[baseName] || '';
+                            return <div key={name} className="rounded-lg border border-amber-200 bg-white p-3">
+                              <div className="flex items-center justify-between gap-2"><strong className="font-mono text-xs text-slate-900">{name}</strong><span className="text-[10px] font-semibold text-amber-800">{field.aggregation || 'MEASURE'}</span></div>
+                              <div className="mt-2 break-all font-mono text-[11px] text-slate-700">{formula || 'No calculation expression is present in the resolved metadata.'}</div>
+                              {baseName !== name && formula && <div className="mt-1 text-[10px] text-emerald-700">Formula resolved from metadata measure: {baseName}</div>}
+                            </div>;
+                          })}
+                        </div>
+                      </div>
                       {selectedSourceCds && stagingResults.some((item) => item.source.toLowerCase() === selectedSourceCds.toLowerCase()) && (
                         <div className="rounded-xl border border-purple-300 bg-purple-50 p-4 space-y-3">
                           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-purple-200 pb-2">
-                            <h4 className="text-xs font-bold uppercase tracking-wide text-purple-900">Datasphere fields to add to the primary CDS source</h4>
-                            <span className="text-[11px] text-purple-700">{fieldComparison?.new_fields?.length || 0} fields not found in {selectedSourceCds}</span>
+                            <h4 className="text-xs font-bold uppercase tracking-wide text-purple-900">Final fields not mapped to a staged source column</h4>
+                            <span className="text-[11px] text-purple-700">{fieldComparison?.new_fields?.filter((field) => !joinedSourceResult?.field_mappings?.some((mapping: { output_field: string; kind: string }) => mapping.output_field.toLowerCase() === field.name.toLowerCase() && mapping.kind === 'source')).length || 0} fields still need a metadata calculation</span>
                           </div>
                           {loadingComparison ? (
-                            <p className="text-xs text-purple-700">Comparing the primary CDS columns with the Datasphere fact view…</p>
-                          ) : fieldComparison?.new_fields?.length ? (
+                            <p className="text-xs text-purple-700">Checking final view fields against all staged source columns…</p>
+                          ) : fieldComparison?.new_fields?.filter((field) => !joinedSourceResult?.field_mappings?.some((mapping: { output_field: string; kind: string }) => mapping.output_field.toLowerCase() === field.name.toLowerCase() && mapping.kind === 'source')).length ? (
                             <div className="space-y-2">
-                              {fieldComparison.new_fields.map((field) => (
+                              {fieldComparison.new_fields.filter((field) => !joinedSourceResult?.field_mappings?.some((mapping: { output_field: string; kind: string }) => mapping.output_field.toLowerCase() === field.name.toLowerCase() && mapping.kind === 'source')).map((field) => (
                                 <div key={field.name} className="rounded-lg border border-purple-200 bg-white p-3">
                                   <div className="mb-1 flex flex-wrap items-center gap-2">
                                     <strong className="font-mono text-xs text-purple-900">{field.name}</strong>
@@ -3995,38 +4356,33 @@ export default function AnalyticsDashboard() {
                               ))}
                             </div>
                           ) : (
-                            <p className="text-xs text-purple-800">No Datasphere-only fields with formulas were found for this primary CDS source.</p>
+                            <p className="text-xs text-purple-800">Every non-calculated final field was found in the staged source set; calculated measures are listed above from the Datasphere metadata.</p>
                           )}
                         </div>
                       )}
                       <div className="flex justify-between border-t border-slate-200 pt-4">
-                        <button type="button" onClick={() => setWorkflowStep(2)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">Back to source data</button>
-                        <button type="button" disabled={loadingComparison} onClick={() => setWorkflowStep(4)} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-wait disabled:opacity-60">Continue to CDS replica</button>
+                        <span className="text-xs text-slate-500">Metadata calculations and final projection are applied automatically.</span>
                       </div>
                       </>}
-                      {workflowStep === 4 && <>
+                      {workflowStep === 5 && <>
                       <div id="workflow-replica" className="rounded-xl border border-blue-200 bg-white p-4 space-y-4">
                         <div>
                           <h3 className="text-sm font-bold text-black">Create CDS replica data</h3>
-                          <p className="mt-1 text-xs text-slate-700">Apply the reviewed Datasphere calculations and model filters to the staged primary source.</p>
+                          <p className="mt-1 text-xs text-slate-700">{selectedCdsForStaging.length > 1 ? 'Join every staged source using the Datasphere model join conditions, then apply calculations and filters and project the final fields.' : 'Use the single staged CDS source directly, apply its calculations and filters, and project the final model fields.'}</p>
                         </div>
-                        <label className="flex items-start gap-2 rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-black">
-                          <input type="checkbox" checked={replicaMetadataConfirmed} onChange={(event) => { setReplicaMetadataConfirmed(event.target.checked); setReplicaCsvResult(null); }} className="mt-0.5 accent-blue-600" />
-                          <span>I reviewed the calculated fields and confirm these formulas should be applied to the staged CDS source.</span>
-                        </label>
                         {replicaCsvError && <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">{replicaCsvError}</div>}
                         <div className="flex flex-wrap items-center justify-between gap-3">
-                          <span className="text-xs text-slate-700">Source: <strong className="font-mono text-black">{selectedSourceCds || 'No primary CDS source selected'}</strong> · output preview capped at 1,000 rows</span>
-                          <button type="button" onClick={() => void handleCreateReplicaCsv()} disabled={!replicaMetadataConfirmed || replicaCsvBusy || !selectedSourceCds || !stagingResults.some((item) => item.source.toLowerCase() === selectedSourceCds.toLowerCase())}
-                            className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-bold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">
-                            {replicaCsvBusy ? 'Creating final CSV…' : 'Create final CDS replica CSV'}
-                          </button>
+                          <span className="text-xs text-slate-700">Sources: <strong className="font-mono text-black">{selectedCdsForStaging.join(', ')}</strong></span>
+                          {replicaCsvBusy && <span className="text-xs font-semibold text-blue-700">{selectedCdsForStaging.length > 1 ? 'Joining sources and building final projection…' : 'Adding calculated fields to the source and building final projection…'}</span>}
                         </div>
-                        {replicaCsvBusy && <p className="text-xs font-medium text-blue-800">Applying Datasphere model filters, CDS metadata filters, and formulas to the staged source, then writing the final CSV…</p>}
+                        <div className="flex justify-end border-t border-slate-200 pt-3">
+                        </div>
+                        {replicaCsvBusy && <p className="text-xs font-medium text-blue-800">{selectedCdsForStaging.length > 1 ? 'Applying the Datasphere join, calculations, filters, and final projection to all staged sources…' : 'Applying calculations, filters, and the final projection directly to the staged source…'}</p>}
                         {replicaCsvResult && (
                           <div className="space-y-3 rounded-lg border border-blue-200 bg-blue-50/50 p-3">
                             <div className="flex flex-wrap items-center justify-between gap-2">
                               <div className="text-sm font-semibold text-black">Final CDS replica CSV created · {replicaCsvResult.row_count.toLocaleString()} rows · {replicaCsvResult.columns.length} columns</div>
+                              {!!replicaCsvResult.omitted_output_fields?.length && <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">Omitted {replicaCsvResult.omitted_output_fields.length} final-view field(s) that could not be built from the available CDS source data: {replicaCsvResult.omitted_output_fields.map((item: { field: string }) => item.field).join(', ')}. Statistics will use the available projected fields.</div>}
                               <a href={replicaCsvResult.download_url} download={replicaCsvResult.filename} className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">Download final CSV</a>
                             </div>
                             {replicaCsvResult.applied_metadata_filter && (
@@ -4059,8 +4415,6 @@ export default function AnalyticsDashboard() {
                         )}
                       </div>
                       {replicaCsvResult && <div className="flex justify-between border-t border-slate-200 pt-4">
-                        <button type="button" onClick={() => setWorkflowStep(3)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">Back to calculations</button>
-                        <button type="button" onClick={() => { setActiveTab('validation'); window.setTimeout(() => document.getElementById('workflow-validation')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80); }} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">Continue to verification</button>
                       </div>}
                       </>}
                     </div>

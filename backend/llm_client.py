@@ -1044,9 +1044,74 @@ def compile_reconciliation_blueprint_deterministic(
             )
         join_entities.append((left_entity, right_entity, sql_join_type, condition))
 
+    # A projected join key can appear in more than one staged source. Keep a
+    # deterministic source for that field only when the Datasphere join
+    # metadata explicitly equates the same field on both sides. For INNER and
+    # LEFT OUTER joins the left-side key is the correct projected value.
+    joined_field_sources: Dict[str, str] = {}
+    field_reference = re.compile(
+        r"^\s*(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)[.~])?"
+        r"[\"`]?(?P<field>[A-Za-z_][A-Za-z0-9_]*)[\"`]?\s*$"
+    )
+    equality = re.compile(r"(?P<left>[^=<>!]+?)\s*=\s*(?P<right>[^=<>!]+)")
+    for left_entity, right_entity, _join_type, condition in join_entities:
+        for clause in re.split(r"\s+AND\s+", condition, flags=re.IGNORECASE):
+            clause = clause.strip()
+            while clause.startswith("(") and clause.endswith(")"):
+                clause = clause[1:-1].strip()
+            match = equality.fullmatch(clause)
+            if not match:
+                continue
+            left_ref = field_reference.fullmatch(match.group("left"))
+            right_ref = field_reference.fullmatch(match.group("right"))
+            if not left_ref or not right_ref:
+                continue
+            left_field = left_ref.group("field")
+            right_field = right_ref.group("field")
+            if left_field.casefold() != right_field.casefold():
+                continue
+            left_owner = source_names.get(
+                (left_ref.group("qualifier") or "").casefold(), left_entity
+            )
+            right_owner = source_names.get(
+                (right_ref.group("qualifier") or "").casefold(), right_entity
+            )
+            field_key = left_field.casefold()
+            if (
+                left_owner.casefold() != right_owner.casefold()
+                and field_key in source_fields.get(left_owner.casefold(), {})
+                and field_key in source_fields.get(right_owner.casefold(), {})
+            ):
+                joined_field_sources.setdefault(field_key, left_owner)
+
     def translate_join_expression(expression: str) -> str:
         if len(source_metadata) == 1:
             return _translate_metadata_expression(expression, cds_fields, cds_name)
+        # Datasphere formula metadata can refer to inputs using synthetic
+        # labels such as `Source Columns 1_1.CreationDate`. Resolve those
+        # labels through the verified staged source fields before parsing
+        # ordinary CDS aliases.
+        pseudo_source = re.compile(
+            r'(?i)(?:"?Source\s+Columns\s+\d+_\d+"?)\s*[.~]\s*["`]?'
+            r'(?P<field>[A-Za-z_][A-Za-z0-9_]*)["`]?(?![A-Za-z0-9_])'
+        )
+
+        def resolve_pseudo_source(match: re.Match[str]) -> str:
+            field = match.group("field")
+            owners = all_field_owners.get(field.casefold(), [])
+            root_owner = join_entities[0][0] if join_entities else cds_name
+            owner = next(
+                (item for item in owners if item.casefold() == root_owner.casefold()),
+                owners[0] if len(owners) == 1 else None,
+            )
+            if owner is None:
+                raise ValueError(
+                    f"Calculated-field input {field!r} is missing or ambiguous across verified CDS sources."
+                )
+            canonical = source_fields[owner.casefold()].get(field.casefold())
+            return f"{owner}~{canonical}"
+
+        expression = pseudo_source.sub(resolve_pseudo_source, expression)
         reserved = {
             "and", "or", "not", "is", "null", "like", "in", "between",
             "case", "when", "then", "else", "end", "as", "true", "false",
@@ -1086,6 +1151,8 @@ def compile_reconciliation_blueprint_deterministic(
                         )
                     return f"{entity}~{canonical_field}"
                 owners = all_field_owners.get(field.casefold(), [])
+                if len(owners) != 1 and joined_field_sources.get(field.casefold()) in owners:
+                    owners = [joined_field_sources[field.casefold()]]
                 if len(owners) != 1:
                     raise ValueError(
                         f"Unqualified field {field!r} is missing or ambiguous across verified CDS sources."
@@ -1131,21 +1198,97 @@ def compile_reconciliation_blueprint_deterministic(
         for item in transformation_ir.get("projections", [])
         if isinstance(item, dict) and item.get("output_field") and item.get("source_field")
     }
+    # Preserve source provenance from each Datasphere projection. The flat
+    # source_field mapping above loses the owning wrapper, which makes fields
+    # such as CompanyCode look ambiguous when they exist in both staged CDS
+    # datasets.
+    projection_source_entities: Dict[str, str] = {}
+    for item in transformation_ir.get("projections", []):
+        if not isinstance(item, dict) or not item.get("output_field"):
+            continue
+        output_key = str(item["output_field"]).casefold()
+        source_ref = item.get("source_ref")
+        ref_parts = [str(part) for part in source_ref] if isinstance(source_ref, list) else []
+        source_field = str(item.get("source_field") or (ref_parts[-1] if ref_parts else ""))
+        if not source_field:
+            continue
+        candidate_entities = []
+        for reference_part in ref_parts[:-1]:
+            entity = source_names.get(reference_part.casefold())
+            if entity:
+                candidate_entities.append(entity)
+        owner_entity = source_names.get(str(item.get("owner") or "").casefold())
+        if owner_entity:
+            candidate_entities.append(owner_entity)
+        candidate_entities = list(dict.fromkeys(candidate_entities))
+        verified_candidates = [
+            entity for entity in candidate_entities
+            if source_field.casefold() in source_fields.get(entity.casefold(), {})
+        ]
+        if len(verified_candidates) == 1:
+            projection_source_entities.setdefault(
+                output_key,
+                f"{verified_candidates[0]}~{source_fields[verified_candidates[0].casefold()][source_field.casefold()]}",
+            )
     projection_sources.update(grain_mappings)
 
     def selected_source_field(field_name: str) -> Optional[str]:
+        projected_source = projection_source_entities.get(field_name.casefold())
+        if projected_source:
+            return projected_source
         mapped = projection_sources.get(
             field_name.casefold(),
             str(field_meta.get(field_name.casefold(), {}).get("source_field") or field_name),
         )
-        return cds_fields.get(mapped.casefold())
+        mapped_key = mapped.casefold()
+        source_field = cds_fields.get(mapped_key)
+        if source_field:
+            return source_field
+        preferred_owner = joined_field_sources.get(mapped_key)
+        if preferred_owner:
+            canonical_field = source_fields.get(preferred_owner.casefold(), {}).get(mapped_key)
+            if canonical_field:
+                return f"{preferred_owner}~{canonical_field}"
+        # The joined projection can contain a field in multiple source views
+        # (for example CompanyCode) even when the Datasphere projection chose
+        # one concrete source. If wrapper provenance was not emitted for that
+        # projection, use the left/root entity from the verified join chain
+        # when it contains the requested field. This matches the source
+        # preference used by the staged joined-dataset projection and avoids
+        # rejecting a valid field merely because another source also has it.
+        owners = all_field_owners.get(mapped_key, [])
+        if owners:
+            root_owner = join_entities[0][0] if join_entities else cds_name
+            selected_owner = next(
+                (owner for owner in owners if owner.casefold() == root_owner.casefold()),
+                owners[0],
+            )
+            canonical_field = source_fields.get(selected_owner.casefold(), {}).get(mapped_key)
+            if canonical_field:
+                return f"{selected_owner}~{canonical_field}"
+        return None
 
     def output_expression(field_name: str) -> str:
         lowered = field_name.casefold()
         if lowered in calc_map:
-            raw = _expand_calculated_field_dependencies(
-                calc_map[lowered], calc_definitions, projection_sources
-            ).strip()
+            try:
+                raw = _expand_calculated_field_dependencies(
+                    calc_map[lowered], calc_definitions, projection_sources
+                ).strip()
+            except ValueError as exc:
+                # Some Datasphere projections repeat a passthrough field in
+                # the calculated-column catalog as a self-reference (for
+                # example CompanyCode -> CompanyCode). If that same output is
+                # present in a verified staged source, use the source column;
+                # otherwise preserve the cycle error for a real calculation.
+                source_field = selected_source_field(field_name)
+                direct_self_cycle = re.search(
+                    rf"{re.escape(lowered)}\s*->\s*{re.escape(lowered)}",
+                    str(exc), re.IGNORECASE,
+                )
+                if not direct_self_cycle or not source_field:
+                    raise
+                return translate_join_expression(source_field)
             if raw.startswith("'") and raw.endswith("'"):
                 return "'" + raw[1:-1].replace("''", "'").replace("'", "''") + "'"
             if raw.startswith('"') and raw.endswith('"'):
@@ -1162,7 +1305,27 @@ def compile_reconciliation_blueprint_deterministic(
             f"No verified source field or calculation maps selected output {field_name!r}."
         )
 
+    # A final Datasphere projection may include a field whose source is not
+    # available in the staged CDS snapshots. Omit only that output and keep
+    # building the remaining projection so the validation/statistics step can
+    # still run.
+    omitted_output_fields: List[Dict[str, str]] = []
+    available_output_fields: List[str] = []
+    for output_field in all_output_fields:
+        try:
+            output_expression(output_field)
+            available_output_fields.append(output_field)
+        except (ValueError, KeyError) as exc:
+            omitted_output_fields.append({"field": output_field, "reason": str(exc)})
+    all_output_fields = available_output_fields
+    available_keys = {name.casefold() for name in all_output_fields}
+    key_fields = [name for name in key_fields if str(name).casefold() in available_keys]
+    if not all_output_fields:
+        raise ValueError("No final Datasphere fields could be built from the available staged CDS sources.")
+
     def is_measure(field_name: str) -> bool:
+        if architecture_metadata.get("preserve_source_rows"):
+            return False
         metadata = field_meta.get(field_name.casefold(), {})
         return bool(metadata.get("is_measure") or metadata.get("measure_type") or metadata.get("aggregation"))
 
@@ -1355,6 +1518,7 @@ def compile_reconciliation_blueprint_deterministic(
         "s4hana_sql": s4hana_sql,
         "output_fields": all_output_fields,
         "key_fields": key_fields,
+        "omitted_output_fields": omitted_output_fields,
         "logic_summary": f"Metadata fallback selected {len(all_output_fields)} outputs from verified CDS entity {cds_name} and retained discovered filters, calculations, and aggregation semantics.",
         "assumptions": [],
     }

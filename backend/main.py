@@ -8,6 +8,7 @@ import sqlite3
 import time
 import uuid
 import tempfile
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
@@ -1303,13 +1304,308 @@ async def download_staged_source_csv(space_id: str, source_name: str):
     return FileResponse(path, media_type="text/csv", filename=filename)
 
 
+def _csn_to_sql_expression(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(part for part in (_csn_to_sql_expression(item) for item in value) if part)
+    if not isinstance(value, dict):
+        return "" if value is None else str(value)
+    if isinstance(value.get("ref"), list):
+        return ".".join(str(part) for part in value["ref"])
+    if "val" in value:
+        literal = value["val"]
+        return "'" + str(literal).replace("'", "''") + "'" if isinstance(literal, str) else ("NULL" if literal is None else str(literal))
+    if "xpr" in value:
+        return _csn_to_sql_expression(value["xpr"])
+    return ""
+
+
+def _datasphere_csn_joins(tree: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read explicit CSN join nodes from Datasphere view definitions."""
+    found: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if str(value.get("join") or "").casefold() in {"inner", "left", "right", "full", "left outer", "inner join", "left outer join"}:
+                args = value.get("args") or []
+                on = value.get("on")
+                if len(args) == 2 and on:
+                    sides = []
+                    for arg in args:
+                        ref = arg.get("ref") if isinstance(arg, dict) else None
+                        if not isinstance(ref, list) or not ref:
+                            sides = []
+                            break
+                        sides.append({"source": str(ref[-1]), "as": str(arg.get("as") or ref[-1])})
+                    condition = _csn_to_sql_expression(on)
+                    if sides and condition:
+                        signature = (sides[0]["as"].casefold(), sides[1]["as"].casefold(), condition.casefold())
+                        if signature not in seen:
+                            seen.add(signature)
+                            found.append({"left": sides[0], "right": sides[1], "join_type": value.get("join"), "condition": condition})
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(tree)
+    return found
+
+
+@app.post("/api/cds-staging/joined-csv")
+async def create_joined_cds_csv(request: dict[str, Any]):
+    """Join all freshly staged model sources using the Datasphere CSN join condition."""
+    space_id = str(request.get("space_id") or DATASPHERE_SPACE_ID).strip()
+    model_name = str(request.get("view_name") or "").strip()
+    source_names = list(dict.fromkeys(str(name).strip() for name in (request.get("source_names") or []) if str(name).strip()))
+    if not space_id or not model_name or not source_names:
+        raise HTTPException(status_code=400, detail="A model and its staged CDS source names are required.")
+
+    client = DatasphereResolverClient(space=space_id)
+    cached_entry = client.cache.get_model_metadata(space_id, model_name) if client.cache else None
+    cached_metadata = cached_entry.get("metadata", {}) if cached_entry else {}
+    tree = cached_metadata.get("dependency_tree") if isinstance(cached_metadata, dict) else None
+    if not isinstance(tree, dict) or not tree:
+        resolver = DatasphereDependencyResolver(client=client, space=space_id, silent=True)
+        tree = await asyncio.to_thread(resolver.resolve, model_name, object_type="analytic_model")
+    if not isinstance(tree, dict) or tree.get("status") != "resolved":
+        raise HTTPException(status_code=422, detail=f"Could not resolve Datasphere source joins for {model_name}.")
+
+    transformation_ir = _build_transformation_ir(tree)
+    joins = transformation_ir.get("joins", [])
+    if len(source_names) == 1:
+        # No join is needed for a model with one resolved CDS input. Ignore
+        # any nested join-shaped metadata that may belong to upstream objects.
+        joins = []
+    elif not joins:
+        joins = _datasphere_csn_joins(tree)
+    if len(source_names) > 1 and not joins:
+        raise HTTPException(status_code=422, detail="The model metadata has multiple sources but no explicit Datasphere join condition.")
+
+    store = CdsStagingStore()
+    staged_by_name = {str(item.get("source", "")).casefold(): item for item in store.list_staged_sources(space_id)}
+    snapshots = []
+    for name in source_names:
+        item = staged_by_name.get(name.casefold())
+        if not item or not item.get("complete") or not item.get("fresh"):
+            raise HTTPException(status_code=409, detail=f"CDS source {name} is not completely staged yet.")
+        snapshots.append(item)
+
+    source_lookup = {str(item["source"]).casefold(): str(item["source"]) for item in snapshots}
+    normalized_joins = []
+    for join in joins:
+        if not isinstance(join, dict):
+            continue
+        normalized = dict(join)
+        for side_name in ("left", "right"):
+            side = normalized.get(side_name)
+            if not isinstance(side, dict):
+                continue
+            label = str(side.get("source") or side.get("name") or "").strip()
+            matched = [entity for key, entity in source_lookup.items() if label.casefold() == key or label.casefold().endswith(key)]
+            if len(matched) != 1:
+                raise HTTPException(status_code=422, detail=f"Datasphere join input {label!r} does not resolve to one staged CDS source.")
+            side["source"] = matched[0]
+            normalized[side_name] = side
+        normalized_joins.append(normalized)
+    if len(snapshots) > 1 and not normalized_joins:
+        raise HTTPException(status_code=422, detail="No verified join connects the staged CDS sources.")
+
+    table_by_entity = {str(item["source"]).casefold(): item for item in snapshots}
+    alias_to_entity: dict[str, str] = {}
+    sql_alias_by_entity: dict[str, str] = {}
+    join_clauses: list[str] = []
+    first = normalized_joins[0] if len(snapshots) > 1 and normalized_joins else None
+    if first:
+        first_side = first["left"]
+        root_entity = str(first_side["source"])
+        root_alias = str(first_side.get("as") or root_entity)
+        alias_to_entity[root_alias.casefold()] = root_entity
+        sql_alias_by_entity[root_entity.casefold()] = root_alias
+        root_table = store._quote_identifier(table_by_entity[root_entity.casefold()]["table_name"])
+        from_sql = f"{root_table} AS {store._quote_identifier(root_alias)}"
+        for join in normalized_joins:
+            right = join["right"]
+            entity = str(right["source"])
+            alias = str(right.get("as") or entity)
+            alias_to_entity[alias.casefold()] = entity
+            sql_alias_by_entity[entity.casefold()] = alias
+            join_type = str(join.get("join_type") or join.get("type") or "inner").casefold()
+            sql_join = "LEFT JOIN" if "left" in join_type else "INNER JOIN"
+            condition = str(join.get("condition") or join.get("on") or "")
+            if isinstance(join.get("on"), (list, dict)):
+                condition = _csn_to_sql_expression(join["on"])
+
+            def qualify_ref(match: re.Match[str]) -> str:
+                qualifier = match.group("alias")
+                owner = alias_to_entity.get(qualifier.casefold())
+                if owner is None:
+                    raise ValueError(f"Join qualifier {qualifier!r} is not present in the Datasphere join inputs.")
+                column_map = {str(column).casefold(): str(column) for column in table_by_entity[owner.casefold()].get("columns", [])}
+                column = column_map.get(match.group("field").casefold())
+                if column is None:
+                    raise ValueError(f"Join field {match.group('field')!r} is missing from staged source {owner}.")
+                sql_alias = sql_alias_by_entity[owner.casefold()]
+                return f"{store._quote_identifier(sql_alias)}.{store._quote_identifier(column)}"
+
+            reference = re.compile(r"(?<![A-Za-z0-9_])(?P<alias>[A-Za-z_][A-Za-z0-9_]*)[.~][\"`]?(?P<field>[A-Za-z_][A-Za-z0-9_]*)[\"`]?(?![A-Za-z0-9_])")
+            translated_condition = reference.sub(qualify_ref, condition)
+            if translated_condition == condition:
+                raise HTTPException(status_code=422, detail=f"Could not translate Datasphere join condition: {condition}")
+            table = store._quote_identifier(table_by_entity[entity.casefold()]["table_name"])
+            from_sql += f" {sql_join} {table} AS {store._quote_identifier(alias)} ON {translated_condition}"
+            join_clauses.append(f"{sql_join} {entity} ON {condition}")
+    elif len(snapshots) == 1:
+        # A single staged source is already the complete input dataset. Do not
+        # inspect or apply model join metadata in this case; project directly
+        # from that source and leave join_conditions empty.
+        entity = str(snapshots[0]["source"])
+        alias = entity
+        alias_to_entity[alias.casefold()] = entity
+        sql_alias_by_entity[entity.casefold()] = alias
+        table = store._quote_identifier(table_by_entity[entity.casefold()]["table_name"])
+        from_sql = f"{table} AS {store._quote_identifier(alias)}"
+
+    # Keep only the selected Datasphere view's final projection. Resolve each
+    # output through its projection ref first, then fall back to a unique
+    # source field. Calculated outputs remain explicit NULL placeholders for
+    # the following calculation step.
+    requested_projection = request.get("projection_fields")
+    if not isinstance(requested_projection, list) or not requested_projection:
+        requested_projection = [str(item.get("name")) for item in tree.get("field_catalog", []) if isinstance(item, dict) and item.get("name")]
+    projection_metadata = {
+        str(item.get("name") or "").casefold(): item
+        for item in requested_projection if isinstance(item, dict) and item.get("name")
+    }
+    requested_projection = list(dict.fromkeys(
+        str(item.get("name") if isinstance(item, dict) else item).strip()
+        for item in requested_projection
+        if str(item.get("name") if isinstance(item, dict) else item).strip()
+    ))
+    projection_by_output = {
+        str(item.get("output_field") or "").casefold(): item
+        for item in transformation_ir.get("projections", [])
+        if isinstance(item, dict) and item.get("output_field")
+    }
+    calculations = {
+        str(item.get("name") or "").casefold()
+        for item in (tree.get("calculated_columns", []) or []) + (transformation_ir.get("calculations", []) or []) + (transformation_ir.get("formulas", []) or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    calculations.update(
+        name for name, item in projection_metadata.items()
+        if item.get("calculation") or item.get("expression") or item.get("is_calculated")
+    )
+    select_parts: list[str] = []
+    pending_calculated_fields: list[str] = []
+    missing_calculation_metadata: list[str] = []
+    field_mappings: list[dict[str, str]] = []
+    for output_field in requested_projection:
+        projection = projection_by_output.get(output_field.casefold(), {})
+        source_field = str(projection.get("source_field") or "")
+        source_ref = projection.get("source_ref") if isinstance(projection.get("source_ref"), list) else []
+        owners: list[str] = []
+        for reference_part in source_ref[:-1]:
+            owner = alias_to_entity.get(str(reference_part).casefold())
+            if owner is None:
+                matching_sources = [str(item["source"]) for item in snapshots if str(reference_part).casefold().endswith(str(item["source"]).casefold())]
+                owner = matching_sources[0] if len(matching_sources) == 1 else None
+            if owner:
+                owners.append(owner)
+        if not source_field and source_ref:
+            source_field = str(source_ref[-1])
+        if source_field:
+            owners = list(dict.fromkeys(owner for owner in owners if source_field.casefold() in {str(column).casefold() for column in table_by_entity[owner.casefold()].get("columns", [])}))
+        # Projection metadata can name the output differently from its source
+        # field, and wrapper aliases are not always present in the lineage
+        # alias map. Search every staged source by the metadata source field
+        # before falling back to an exact output-name match.
+        if not owners and source_field:
+            owners = [
+                str(item["source"]) for item in snapshots
+                if source_field.casefold() in {str(column).casefold() for column in item.get("columns", [])}
+            ]
+        if not owners:
+            owners = [str(item["source"]) for item in snapshots if output_field.casefold() in {str(column).casefold() for column in item.get("columns", [])}]
+            if owners:
+                source_field = output_field
+        if len(owners) > 1:
+            root_owner = str(normalized_joins[0]["left"]["source"]) if normalized_joins else ""
+            owners = [root_owner] if root_owner in owners else owners[:1]
+        if owners:
+            owner = owners[0]
+            column_map = {str(column).casefold(): str(column) for column in table_by_entity[owner.casefold()].get("columns", [])}
+            column = column_map.get(source_field.casefold()) or column_map.get(output_field.casefold())
+            if column:
+                sql_alias = sql_alias_by_entity[owner.casefold()]
+                select_parts.append(f"{store._quote_identifier(sql_alias)}.{store._quote_identifier(column)} AS {store._quote_identifier(output_field)}")
+                field_mappings.append({"output_field": output_field, "source": owner, "source_field": column, "kind": "source"})
+                continue
+        field_metadata = projection_metadata.get(output_field.casefold(), {})
+        if output_field.casefold() in calculations or str(field_metadata.get("category") or "").casefold() == "measure":
+            pending_calculated_fields.append(output_field)
+            if not (field_metadata.get("calculation") or field_metadata.get("expression")) and output_field.casefold() not in calculations:
+                missing_calculation_metadata.append(output_field)
+            select_parts.append(f"NULL AS {store._quote_identifier(output_field)}")
+            field_mappings.append({"output_field": output_field, "source": "Datasphere calculation", "source_field": output_field, "kind": "calculated"})
+        else:
+            raise HTTPException(status_code=422, detail=f"Final Datasphere field {output_field!r} cannot be mapped to a staged source or calculated column.")
+    if not select_parts:
+        raise HTTPException(status_code=422, detail="The selected Datasphere view has no final fields to project.")
+
+    export_id = uuid.uuid4().hex
+    path = _cds_csv_export_path(export_id)
+    db = store._connect()
+    allowed_tables = {str(item["table_name"]).casefold() for item in snapshots}
+    db.set_authorizer(lambda action, arg1, _arg2, _database, _trigger:
+        sqlite3.SQLITE_OK if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE)
+        or (action == sqlite3.SQLITE_READ and str(arg1).casefold() in allowed_tables) else sqlite3.SQLITE_DENY)
+    try:
+        cursor = db.execute(f"SELECT {', '.join(select_parts)} FROM {from_sql}")
+        columns = [str(item[0]) for item in cursor.description or []]
+        row_count = 0
+        preview = []
+        with path.open("w", encoding="utf-8-sig", newline="") as output_file:
+            writer = csv.DictWriter(output_file, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            while rows := cursor.fetchmany(1000):
+                for values in rows:
+                    row = dict(zip(columns, values))
+                    writer.writerow(row)
+                    if len(preview) < 50:
+                        preview.append(row)
+                    row_count += 1
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", model_name)
+        return {"status": "JOINED_CSV_CREATED", "view_name": model_name, "source_names": source_names,
+                "row_count": row_count, "columns": columns, "preview": preview,
+                "projected_fields": requested_projection, "pending_calculated_fields": pending_calculated_fields,
+                "missing_calculation_metadata": missing_calculation_metadata,
+                "field_mappings": field_mappings,
+                "join_conditions": join_clauses, "execution_engine": "Read-only SQLite over all staged CDS sources",
+                "sql": f"SELECT {', '.join(select_parts)} FROM {from_sql}",
+                "export_id": export_id, "download_url": f"/api/cds-staging/exports/{export_id}",
+                "filename": f"{safe_name}_joined_sources.csv"}
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=f"Could not join the staged CDS sources: {exc}") from exc
+    finally:
+        db.close()
+
+
 @app.post("/api/cds-staging/replica-csv")
 async def create_cds_replica_csv(request: dict[str, Any]):
-    """Apply reviewed calculated fields to a staged source and create the final CSV."""
+    """Rebuild the Datasphere projection from all staged sources and its metadata joins."""
     space_id = str(request.get("space_id") or DATASPHERE_SPACE_ID).strip()
     source_name = str(request.get("source_name") or "").strip()
-    if not space_id or not source_name:
-        raise HTTPException(status_code=400, detail="A Datasphere space and primary CDS source are required.")
+    source_names = request.get("source_names")
+    if not isinstance(source_names, list) or not source_names:
+        source_names = [source_name] if source_name else []
+    source_names = list(dict.fromkeys(str(name).strip() for name in source_names if str(name).strip()))
+    if not space_id or not source_names:
+        raise HTTPException(status_code=400, detail="A Datasphere space and staged CDS sources are required.")
     raw_calculated_fields = request.get("calculated_fields") or {}
     if not isinstance(raw_calculated_fields, dict):
         raise HTTPException(status_code=400, detail="Calculated fields must be a name-to-formula mapping.")
@@ -1327,95 +1623,200 @@ async def create_cds_replica_csv(request: dict[str, Any]):
 
     export_id = uuid.uuid4().hex
     path = _cds_csv_export_path(export_id)
-    cds_where = None
-    datasphere_where = None
     try:
-        # Read the selected CDS entity's own DDL metadata so its WHERE clause
-        # is reproduced when the staged snapshot is exported as the replica.
-        if USE_SAP_ADT:
-            cfg = get_config()
-            with CDSMetadataClient(cfg["base_url"], cfg["username"], cfg["password"]) as metadata_client:
-                cds_metadata = metadata_client.discover_metadata(source_name)
-            lineage = cds_metadata.get("lineage") if isinstance(cds_metadata, dict) else None
-            cds_where = lineage.get("where") if isinstance(lineage, dict) else None
         model_name = str(request.get("view_name") or "").strip()
-        if model_name:
-            client = DatasphereResolverClient(space=space_id)
-            cached_entry = client.cache.get_model_metadata(space_id, model_name) if client.cache else None
-            cached_metadata = cached_entry.get("metadata", {}) if cached_entry else {}
-            dependency_tree = cached_metadata.get("dependency_tree") if isinstance(cached_metadata, dict) else None
-            if not isinstance(dependency_tree, dict) or not dependency_tree:
-                resolver = DatasphereDependencyResolver(client=client, space=space_id, silent=True)
-                dependency_tree = await asyncio.to_thread(
-                    resolver.resolve, model_name, object_type="analytic_model",
-                )
-            if not isinstance(dependency_tree, dict) or dependency_tree.get("status") != "resolved":
-                raise ValueError(f"Could not resolve Datasphere filters for model {model_name}.")
-            transformation_ir = _build_transformation_ir(dependency_tree)
-            model_filters = transformation_ir.get("filters", []) if isinstance(transformation_ir, dict) else []
-            if model_filters:
-                if not USE_SAP_ADT:
-                    raise ValueError("S/4HANA ADT metadata is required to translate Datasphere model filters to CDS fields.")
-                if not cds_metadata.get("fields"):
-                    raise ValueError(f"ADT returned no projected fields for CDS source {source_name}.")
-                from llm_client import compile_reconciliation_blueprint_deterministic
-                filter_ir = {
-                    "filters": model_filters,
-                    "calculations": transformation_ir.get("calculations", []),
-                    "formulas": transformation_ir.get("formulas", []),
-                    "constants": transformation_ir.get("constants", []),
-                }
-                filter_plan = compile_reconciliation_blueprint_deterministic(
-                    model_name=model_name,
-                    space_id=space_id,
-                    architecture_metadata={
-                        "dependency_tree": dependency_tree,
-                        "transformation_ir": filter_ir,
-                    },
-                    source_metadata=[cds_metadata],
-                    # A single verified CDS output is enough to compile the
-                    # model filter; filtering must not depend on unrelated
-                    # projected columns mapping successfully.
-                    selected_fields=[str(cds_metadata["fields"][0].get("name"))],
-                    key_fields=[],
-                )
-                s4_sql = str(filter_plan.get("s4hana_sql") or "")
-                if re.search(r"\bHAVING\b", s4_sql, re.IGNORECASE):
-                    raise ValueError(
-                        "The Datasphere model has an aggregate HAVING filter. It cannot be applied to the row-level CDS replica before aggregation."
-                    )
-                where_match = re.search(
-                    r"\bWHERE\b(.*?)(?=\bGROUP\s+BY\b|\bHAVING\b|$)",
-                    s4_sql,
-                    re.IGNORECASE | re.DOTALL,
-                )
-                if not where_match or not where_match.group(1).strip():
-                    raise ValueError(
-                        "The selected Datasphere model has filters, but they could not be compiled as CDS row filters."
-                    )
-                datasphere_where = where_match.group(1).strip()
-        combined_filters = [item.strip() for item in (cds_where, datasphere_where) if isinstance(item, str) and item.strip()]
-        combined_where = " AND ".join(f"({item})" for item in combined_filters) or None
-        result = await asyncio.to_thread(
-            CdsStagingStore().write_source_csv,
-            space_id=space_id, source_name=source_name, output_path=path,
-            selected_fields=[str(name) for name in selected_fields] if selected_fields is not None else None,
-            calculated_fields=calculated_fields,
-            where_clause=combined_where,
+        if not model_name:
+            raise ValueError("The selected Datasphere model name is required to rebuild its source joins.")
+        client = DatasphereResolverClient(space=space_id)
+        cached_entry = client.cache.get_model_metadata(space_id, model_name) if client.cache else None
+        cached_metadata = cached_entry.get("metadata", {}) if cached_entry else {}
+        dependency_tree = cached_metadata.get("dependency_tree") if isinstance(cached_metadata, dict) else None
+        if not isinstance(dependency_tree, dict) or not dependency_tree:
+            resolver = DatasphereDependencyResolver(client=client, space=space_id, silent=True)
+            dependency_tree = await asyncio.to_thread(resolver.resolve, model_name, object_type="analytic_model")
+        if not isinstance(dependency_tree, dict) or dependency_tree.get("status") != "resolved":
+            raise ValueError(f"Could not resolve Datasphere join metadata for model {model_name}.")
+
+        store = CdsStagingStore()
+        staged_by_name = {str(item.get("source", "")).casefold(): item for item in store.list_staged_sources(space_id)}
+        snapshots = []
+        for name in source_names:
+            snapshot = staged_by_name.get(name.casefold())
+            if not snapshot or not snapshot.get("complete") or not snapshot.get("fresh"):
+                raise ValueError(f"Source {name} has no complete, fresh staged snapshot. Retrieve all model sources again.")
+            snapshots.append(snapshot)
+
+        transformation_ir = _build_transformation_ir(dependency_tree)
+        joins = transformation_ir.get("joins", []) if len(snapshots) > 1 else []
+        if len(snapshots) > 1 and not joins:
+            raise ValueError("The model resolves to multiple CDS sources, but its Datasphere metadata contains no join condition. No cross join was created.")
+
+        # Join operands can be Datasphere wrapper views (for example
+        # WRAP_Z_TESTVIEW02) around replicated CDS entities. Resolve a wrapper
+        # only when its name unambiguously ends in one of the staged CDS names.
+        source_metadata = [{
+            "entity": item["source"],
+            "fields": [{"name": column, "type": item.get("column_types", {}).get(column)} for column in item.get("columns", [])],
+            "key_fields": item.get("key_fields", []),
+        } for item in snapshots]
+        source_lookup = {str(item["entity"]).casefold(): str(item["entity"]) for item in source_metadata}
+        normalized_joins = []
+        for join in joins:
+            if not isinstance(join, dict):
+                continue
+            join = dict(join)
+            for side_name in ("left", "right"):
+                side = join.get(side_name)
+                if not isinstance(side, dict):
+                    continue
+                side = dict(side)
+                label = str(side.get("source") or side.get("name") or "").strip()
+                candidate_matches = [entity for key, entity in source_lookup.items() if label.casefold() == key or label.casefold().endswith(key)]
+                if len(candidate_matches) == 1:
+                    side.setdefault("as", label)
+                    side["source"] = candidate_matches[0]
+                join[side_name] = side
+            normalized_joins.append(join)
+        transformation_ir["joins"] = normalized_joins
+        if calculated_fields:
+            known = {str(item.get("name", "")).casefold() for item in dependency_tree.get("calculated_columns", []) if isinstance(item, dict)}
+            dependency_tree.setdefault("calculated_columns", [])
+            for name, formula in calculated_fields.items():
+                if name.casefold() not in known:
+                    dependency_tree["calculated_columns"].append({"name": name, "expression": formula})
+            transformation_ir["calculations"] = list(transformation_ir.get("calculations", [])) + [
+                {"name": name, "expression": formula} for name, formula in calculated_fields.items()
+            ]
+
+        from llm_client import compile_reconciliation_blueprint_deterministic
+        output_fields = [str(name) for name in selected_fields] if selected_fields is not None else [
+            str(field.get("name")) for field in dependency_tree.get("field_catalog", []) if isinstance(field, dict) and field.get("name")
+        ]
+        key_fields = [str(field.get("name")) for field in dependency_tree.get("field_catalog", []) if isinstance(field, dict) and field.get("name") and field.get("is_key")]
+        plan = compile_reconciliation_blueprint_deterministic(
+            model_name=model_name, space_id=space_id,
+            architecture_metadata={
+                "dependency_tree": dependency_tree,
+                "transformation_ir": transformation_ir,
+                # The local replica is row-level CDS data. Retain all rows
+                # selected by Datasphere filters and calculate statistics
+                # afterward instead of aggregating away duplicate grains.
+                "preserve_source_rows": True,
+            },
+            source_metadata=source_metadata, selected_fields=output_fields, key_fields=key_fields,
         )
+        open_sql = str(plan.get("s4hana_sql") or "").strip().rstrip(";")
+        if not re.match(r"(?is)^SELECT\b", open_sql):
+            raise ValueError("Datasphere metadata did not produce a safe SELECT for the final model projection.")
+        table_by_entity = {str(item["source"]).casefold(): str(item["table_name"]) for item in snapshots}
+        def replace_source(match: re.Match[str]) -> str:
+            keyword, entity = match.group(1), match.group(2)
+            table = table_by_entity.get(entity.casefold())
+            if not table:
+                raise ValueError(f"Generated model query references unstaged CDS source {entity}.")
+            return f'{keyword} {store._quote_identifier(table)} AS {store._quote_identifier(entity)}'
+        local_sql = re.sub(r"(?i)\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", replace_source, open_sql).replace("~", ".")
+        # The deterministic Datasphere translator emits ABAP Open SQL syntax
+        # for substring. Replica evaluation runs in SQLite, so convert that
+        # function form to SQLite substr() while preserving the 0-based ABAP
+        # offset semantics.
+        local_sql = re.sub(
+            r"(?is)\bsubstring\s*\(\s*val\s*=\s*(.*?)\s+off\s*=\s*(-?\d+)\s+len\s*=\s*(\d+)\s*\)",
+            lambda match: f"substr({match.group(1).strip()}, {int(match.group(2)) + 1}, {match.group(3)})",
+            local_sql,
+        )
+        numeric_type_codes = {"N", "I", "P", "F", "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "DECIMAL", "NUMERIC", "NUMBER", "FLOAT", "DOUBLE", "REAL", "DECFLOAT"}
+        numeric_source_columns = {
+            str(column).casefold()
+            for snapshot in snapshots
+            for column, raw_type in (snapshot.get("column_types") or {}).items()
+            if str(raw_type or "").strip().upper() in numeric_type_codes
+            or bool(re.search(r"(?i)(?:^|[._])(?:EDM\.)?(?:INT\d*|INTEGER|BIGINT|SMALLINT|TINYINT|DECIMAL|NUMERIC|NUMBER|FLOAT|DOUBLE|REAL|DECFLOAT)(?:$|[._])", str(raw_type or "")))
+        }
+        if numeric_source_columns:
+            numeric_comparison = re.compile(
+                r"(?P<lhs>(?:(?:\"?[A-Za-z_][A-Za-z0-9_]*\"?)\s*\.\s*)?\"?[A-Za-z_][A-Za-z0-9_]*\"?)"
+                r"\s*(?P<operator><=|>=|<>|!=|=|<|>)\s*"
+                r"(?P<rhs>'[+-]?\d+(?:\.\d+)?'|[+-]?\d+(?:\.\d+)?)"
+            )
+
+            def cast_numeric_comparison(match: re.Match[str]) -> str:
+                lhs = match.group("lhs")
+                field_name = lhs.rsplit(".", 1)[-1].strip().strip("\"").casefold()
+                if field_name not in numeric_source_columns:
+                    return match.group(0)
+                rhs = match.group("rhs")
+                numeric_rhs = rhs[1:-1] if rhs.startswith("'") else rhs
+                return f"CAST({lhs} AS NUMERIC) {match.group('operator')} CAST({numeric_rhs} AS NUMERIC)"
+
+            local_sql = numeric_comparison.sub(cast_numeric_comparison, local_sql)
+        allowed_tables = {str(item["table_name"]).casefold() for item in snapshots}
+        db = store._connect()
+        db.create_function("MONTH", 1, lambda value: int(str(value or "")[4:6]) if len(str(value or "")) >= 6 and str(value or "")[4:6].isdigit() else None, deterministic=True)
+        db.create_function("YEAR", 1, lambda value: int(str(value or "")[:4]) if len(str(value or "")) >= 4 and str(value or "")[:4].isdigit() else None, deterministic=True)
+
+        def parse_formula_date(value: Any, fmt: Optional[str] = None) -> Optional[date]:
+            if value is None or str(value).strip() == "":
+                return None
+            raw = str(value).strip()
+            try:
+                if fmt and fmt.upper() == "YYYYMMDD":
+                    return datetime.strptime(raw[:8], "%Y%m%d").date()
+                if len(raw) == 8 and raw.isdigit():
+                    return datetime.strptime(raw, "%Y%m%d").date()
+                return date.fromisoformat(raw[:10])
+            except (TypeError, ValueError):
+                return None
+
+        db.create_function(
+            "TO_DATE", -1,
+            lambda value, fmt=None: (parse_formula_date(value, fmt).isoformat()
+                                     if parse_formula_date(value, fmt) else None),
+            deterministic=True,
+        )
+        db.create_function(
+            "DAYS_BETWEEN", 2,
+            lambda start, end: ((parse_formula_date(end) - parse_formula_date(start)).days
+                                if parse_formula_date(start) and parse_formula_date(end) else None),
+            deterministic=True,
+        )
+        db.set_authorizer(lambda action, arg1, _arg2, _database, _trigger:
+            sqlite3.SQLITE_OK if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE)
+            or (action == sqlite3.SQLITE_READ and str(arg1).casefold() in allowed_tables) else sqlite3.SQLITE_DENY)
+        try:
+            cursor = db.execute(local_sql)
+            output_columns = [str(item[0]) for item in cursor.description or []]
+            if not output_columns:
+                raise ValueError("The joined Datasphere projection returned no columns.")
+            with path.open("w", encoding="utf-8-sig", newline="") as output_file:
+                writer = csv.DictWriter(output_file, fieldnames=output_columns, extrasaction="ignore")
+                writer.writeheader()
+                row_count = 0
+                preview = []
+                while rows := cursor.fetchmany(1000):
+                    for raw_row in rows:
+                        row = dict(zip(output_columns, raw_row))
+                        writer.writerow(row)
+                        if len(preview) < 20:
+                            preview.append(row)
+                        row_count += 1
+        finally:
+            db.close()
+        result = {"row_count": row_count, "columns": output_columns, "rows": preview, "execution_engine": "Read-only SQLite over all staged CDS sources", "sql": local_sql}
     except Exception as exc:
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=f"Could not create the CDS replica CSV: {exc}") from exc
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", source_name)
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", model_name)
     return {
-        "status": "CSV_CREATED", "source_name": source_name,
+        "status": "CSV_CREATED", "source_name": ", ".join(source_names), "source_names": source_names,
         "export_id": export_id,
         "row_count": result["row_count"], "columns": result["columns"],
         "preview": result["rows"], "calculated_fields": list(calculated_fields),
+        "omitted_output_fields": plan.get("omitted_output_fields", []),
         "execution_engine": result["execution_engine"],
         "replica_sql": result["sql"],
-        "applied_metadata_filter": result.get("where_clause"),
-        "calculated_field_logic": result["calculated_fields"],
+        "applied_metadata_filter": "; ".join(str(item.get("condition") or item.get("expression")) for item in transformation_ir.get("filters", []) if isinstance(item, dict)),
+        "calculated_field_logic": [{"name": name, "formula": formula, "sql_expression": formula} for name, formula in calculated_fields.items()],
         "download_url": f"/api/cds-staging/exports/{export_id}",
         "filename": f"{safe_name}_cds_replica.csv",
     }
