@@ -1293,6 +1293,7 @@ async def download_staged_source_csv(space_id: str, source_name: str):
     """Download the complete staged ADT source as an Excel-compatible CSV."""
     export_id = uuid.uuid4().hex
     path = _cds_csv_export_path(export_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         await asyncio.to_thread(
             CdsStagingStore().write_source_csv,
@@ -1558,6 +1559,7 @@ async def create_joined_cds_csv(request: dict[str, Any]):
 
     export_id = uuid.uuid4().hex
     path = _cds_csv_export_path(export_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     db = store._connect()
     allowed_tables = {str(item["table_name"]).casefold() for item in snapshots}
     db.set_authorizer(lambda action, arg1, _arg2, _database, _trigger:
@@ -1623,6 +1625,7 @@ async def create_cds_replica_csv(request: dict[str, Any]):
 
     export_id = uuid.uuid4().hex
     path = _cds_csv_export_path(export_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         model_name = str(request.get("view_name") or "").strip()
         if not model_name:

@@ -1242,7 +1242,7 @@ export default function AnalyticsDashboard() {
       return result;
     } catch (error: any) {
       setReplicaCsvError(error.message || 'Could not create the CDS replica CSV.');
-      return null;
+      throw error;
     } finally {
       setReplicaCsvBusy(false);
     }

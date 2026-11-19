@@ -6,9 +6,6 @@ from dotenv import load_dotenv
 import sys
 from pathlib import Path
 
-# Load environment variables from .env
-load_dotenv()
-
 # Configure paths so all modular services in backend/ are importable
 BACKEND_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BACKEND_DIR.parent
@@ -28,7 +25,7 @@ ENV_PATHS = [BACKEND_DIR / ".env", REPO_ROOT / ".env", Path.cwd() / ".env"]
 LOADED_ENV_PATH = None
 for p in ENV_PATHS:
     if p.is_file():
-        load_dotenv(dotenv_path=str(p), override=False)
+        load_dotenv(dotenv_path=str(p), override=True)
         if LOADED_ENV_PATH is None:
             LOADED_ENV_PATH = str(p)
 
